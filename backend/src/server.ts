@@ -21,17 +21,36 @@ const app = express();
 const httpServer = createServer(app);
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io", "http://157.245.218.43:8080"],
+    origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io", "http://157.245.218.43:8080","http://localhost:4173"],
     methods: ["GET", "POST"]
   }
 });
 
 app.use(cors({
-  origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io", "http://157.245.218.43:8080"],
+  origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io", "http://157.245.218.43:8080","http://localhost:4173"],
   methods: ["GET", "POST"],
   credentials: true
 }));
 app.use(express.json());
+
+// Health check endpoint
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'MCP Backend Service is running',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
+// Error handling middleware
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Error:', err);
+  res.status(500).json({
+    status: 'error',
+    message: err.message || 'Internal server error'
+  });
+});
 
 interface AnthropicTool {
   name: string;
