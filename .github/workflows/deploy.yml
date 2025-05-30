@@ -13,7 +13,7 @@ jobs:
         with:
           host: 157.245.218.43
           username: root
-          key_path: ${{ secrets.DROPLET_SSH_KEY }}
+          key: ${{ secrets.DROPLET_SSH_KEY }}
           script: |
             cd /var/www/mcp-app
             chmod +x scripts/deploy.sh
