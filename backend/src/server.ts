@@ -19,6 +19,7 @@ if (!ANTHROPIC_API_KEY) {
 const app = express();
 const httpServer = createServer(app);
 const io = new SocketIOServer(httpServer, {
+  path: "/socket.io",
   cors: {
     origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io", "http://157.245.218.43:8080","http://localhost:4173"],
     methods: ["GET", "POST"],
