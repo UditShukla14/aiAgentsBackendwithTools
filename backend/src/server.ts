@@ -21,12 +21,16 @@ const app = express();
 const httpServer = createServer(app);
 const io = new SocketIOServer(httpServer, {
   cors: {
-    origin: ["http://localhost:3000", "http://localhost:5173"], // React dev servers
+    origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io"],
     methods: ["GET", "POST"]
   }
 });
 
-app.use(cors());
+app.use(cors({
+  origin: ["http://localhost:3000", "http://localhost:5173", "https://app.worxstream.io"],
+  methods: ["GET", "POST"],
+  credentials: true
+}));
 app.use(express.json());
 
 interface AnthropicTool {
