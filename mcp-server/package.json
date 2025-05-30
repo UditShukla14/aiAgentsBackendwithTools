@@ -1,0 +1,24 @@
+{
+  "name": "mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server with Multiple Tools",
+  "type": "module",
+  "main": "mcp-server.ts",
+  "scripts": {
+    "start": "tsx mcp-server.ts",
+    "dev": "tsx --watch mcp-server.ts",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "tsx": "^4.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "keywords": ["mcp", "server", "tools", "weather", "utilities"],
+  "author": "",
+  "license": "MIT"
+} 
