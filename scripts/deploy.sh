@@ -13,6 +13,16 @@ git stash push -m "stash before deploy" --include-untracked || true
 git pull origin main
 git stash pop || true
 
+# 🔧 Update Nginx config
+echo "🧩 Updating nginx.conf..."
+sudo cp "$APP_PATH/config/nginx.conf" /etc/nginx/sites-available/default
+
+echo "🧪 Testing Nginx config..."
+sudo nginx -t
+
+echo "🔄 Reloading Nginx..."
+sudo systemctl reload nginx
+
 # Backend
 echo "🔨 Installing & building backend..."
 cd backend
