@@ -1,36 +1,38 @@
 #!/bin/bash
 
-set -e
+set -euo pipefail
 echo "🚀 Starting deployment..."
 
-cd /var/www/mcp-app
+# Base project path
+APP_PATH="/var/www/mcp-app"
+cd "$APP_PATH"
 
-# Stash + pull
+# Pull latest changes
 echo "📥 Stashing and pulling latest changes from Git..."
 git stash push -m "stash before deploy" --include-untracked || true
 git pull origin main
 git stash pop || true
 
-# Build backend
+# Backend
 echo "🔨 Installing & building backend..."
 cd backend
-npm install
+npm ci
 npm run build
 
-# Restart backend via PM2
+# Restart backend service
 echo "🔄 Restarting mcp-backend with PM2..."
 pm2 start ecosystem.config.cjs --only mcp-backend || pm2 restart ecosystem.config.cjs --only mcp-backend
 
-# Build MCP server
+# MCP Server
 echo "🔨 Installing & building MCP server..."
 cd ../mcp-server
-npm install
+npm ci
 npm run build
 
-# ✅ Go BACK to backend folder before restarting mcp-server
+# Restart MCP server service
 echo "🔄 Restarting mcp-server with PM2..."
 cd ../backend
 pm2 start ecosystem.config.cjs --only mcp-server || pm2 restart ecosystem.config.cjs --only mcp-server
 
-cd ..
+cd "$APP_PATH"
 echo "✅ Deployment completed successfully!"
