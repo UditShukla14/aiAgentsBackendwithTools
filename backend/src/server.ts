@@ -14,7 +14,17 @@ import { fileURLToPath } from 'url';
 dotenv.config();
 
 // Add MCP server path configuration
-const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || '../../mcp-server/mcp-server.ts';
+// Resolve __dirname in ES module context
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Dynamically resolve MCP server path for dev/prod
+const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || (
+  process.env.NODE_ENV === 'production'
+    ? path.resolve(__dirname, '../../mcp-server/dist/mcp-server.js')
+    : path.resolve(__dirname, '../../mcp-server/mcp-server.ts')
+);
+
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
@@ -228,11 +238,8 @@ IMPORTANT:
 
   private async initializeAutoConnect() {
     try {
-      // Get absolute path to MCP server - going up two levels from src directory
-      const __filename = fileURLToPath(import.meta.url);
-      const __dirname = path.dirname(__filename);
-      const serverPath = path.resolve(__dirname, MCP_SERVER_PATH);
-      
+      const serverPath = MCP_SERVER_PATH;
+  
       console.log('🔄 Attempting auto-connection to MCP server at:', serverPath);
       
       // Check if file exists before attempting connection
@@ -244,21 +251,21 @@ IMPORTANT:
       
       await this.connectToServer(serverPath);
       console.log('✅ Successfully auto-connected to MCP server');
-      this.autoConnectRetries = 0; // Reset retries on successful connection
+      this.autoConnectRetries = 0;
     } catch (error) {
       this.autoConnectRetries++;
       console.error(`❌ Auto-connection attempt ${this.autoConnectRetries} failed:`, error);
       
-      // Retry with exponential backoff if we haven't exceeded max retries
       if (this.autoConnectRetries < this.maxAutoConnectRetries) {
         const backoffMs = Math.min(1000 * Math.pow(2, this.autoConnectRetries), 10000);
-        console.log(`🔄 Retrying auto-connection in ${backoffMs/1000} seconds...`);
+        console.log(`🔄 Retrying auto-connection in ${backoffMs / 1000} seconds...`);
         setTimeout(() => this.initializeAutoConnect(), backoffMs);
       } else {
         console.error('❌ Max auto-connection retries exceeded. Manual connection will be required.');
       }
     }
   }
+  
 
   async connectToServer(serverScriptPath: string) {
     try {
