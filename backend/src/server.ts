@@ -1,4 +1,3 @@
-// server.ts - Backend service for MCP React UI
 import express from 'express';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
@@ -9,8 +8,13 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import dotenv from "dotenv";
 import { ContextManager } from "./context-manager.js";
 import { randomUUID } from 'crypto';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
+
+// Add MCP server path configuration
+const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || '../mcp-server/mcp-server.ts';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
@@ -55,6 +59,8 @@ class MCPBackendService {
   private tools: AnthropicTool[] = [];
   private isConnected = false;
   private contextManager: ContextManager;
+  private autoConnectRetries: number = 0;
+  private maxAutoConnectRetries: number = 3;
 
   private readonly SYSTEM_PROMPT = `You are a helpful business assistant with access to InvoiceMakerPro tools for managing products, customers, invoices, and estimates. 
 
@@ -89,6 +95,35 @@ IMPORTANT CONTEXT HANDLING:
     });
     this.mcp = new Client({ name: "mcp-client-web", version: "1.0.0" });
     this.contextManager = new ContextManager();
+    
+    // Start auto-connection process
+    this.initializeAutoConnect();
+  }
+
+  private async initializeAutoConnect() {
+    try {
+      // Get absolute path to MCP server
+      const __filename = fileURLToPath(import.meta.url);
+      const __dirname = path.dirname(__filename);
+      const serverPath = path.resolve(__dirname, MCP_SERVER_PATH);
+      
+      console.log('🔄 Attempting auto-connection to MCP server at:', serverPath);
+      await this.connectToServer(serverPath);
+      console.log('✅ Successfully auto-connected to MCP server');
+      this.autoConnectRetries = 0; // Reset retries on successful connection
+    } catch (error) {
+      this.autoConnectRetries++;
+      console.error(`❌ Auto-connection attempt ${this.autoConnectRetries} failed:`, error);
+      
+      // Retry with exponential backoff if we haven't exceeded max retries
+      if (this.autoConnectRetries < this.maxAutoConnectRetries) {
+        const backoffMs = Math.min(1000 * Math.pow(2, this.autoConnectRetries), 10000);
+        console.log(`🔄 Retrying auto-connection in ${backoffMs/1000} seconds...`);
+        setTimeout(() => this.initializeAutoConnect(), backoffMs);
+      } else {
+        console.error('❌ Max auto-connection retries exceeded. Manual connection will be required.');
+      }
+    }
   }
 
   async connectToServer(serverScriptPath: string) {
@@ -396,9 +431,18 @@ io.on('connection', async (socket) => {
   console.log(`✅ Created optimized session ${sessionId} for socket ${socket.id}`);
 
   // Send current connection status
-  socket.emit('connection_status', mcpService.getConnectionStatus());
+  const connectionStatus = mcpService.getConnectionStatus();
+  socket.emit('connection_status', connectionStatus);
+  
+  // If already connected via auto-connect, send success message
+  if (connectionStatus.isConnected) {
+    socket.emit('connection_success', {
+      message: 'Connected to MCP server',
+      tools: connectionStatus.tools
+    });
+  }
 
-  // Handle server connection requests
+  // Keep manual connection handler for fallback/reconnection
   socket.on('connect_server', async (data) => {
     try {
       const { serverPath } = data;
@@ -491,20 +535,42 @@ io.on('connection', async (socket) => {
 
 // REST API endpoints (alternative to WebSocket)
 app.get('/api/status', (req, res) => {
-  res.json(mcpService.getConnectionStatus());
+  const status = mcpService.getConnectionStatus();
+  res.json({
+    ...status,
+    autoConnectRetries: mcpService['autoConnectRetries'],
+    maxAutoConnectRetries: mcpService['maxAutoConnectRetries']
+  });
 });
 
+// Keep manual connect endpoint for fallback/reconnection
 app.post('/api/connect', async (req, res) => {
   try {
     const { serverPath } = req.body;
     const result = await mcpService.connectToServer(serverPath);
-    res.json({ success: true, tools: result.tools });
+    res.json({ 
+      success: true, 
+      tools: result.tools,
+      message: 'Manual connection successful'
+    });
   } catch (error) {
     res.status(500).json({ 
       success: false, 
-      error: error instanceof Error ? error.message : 'Connection failed' 
+      error: error instanceof Error ? error.message : 'Connection failed',
+      autoConnectRetries: mcpService['autoConnectRetries']
     });
   }
+});
+
+// Add health check endpoint
+app.get('/api/health', (req, res) => {
+  const status = mcpService.getConnectionStatus();
+  res.json({
+    status: status.isConnected ? 'healthy' : 'unhealthy',
+    connected: status.isConnected,
+    tools: status.tools,
+    autoConnectRetries: mcpService['autoConnectRetries']
+  });
 });
 
 app.post('/api/query', async (req, res) => {
