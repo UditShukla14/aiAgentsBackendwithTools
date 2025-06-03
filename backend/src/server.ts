@@ -14,7 +14,7 @@ import { fileURLToPath } from 'url';
 dotenv.config();
 
 // Add MCP server path configuration
-const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || '../mcp-server/mcp-server.ts';
+const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || '../../mcp-server/mcp-server.ts';
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
@@ -100,14 +100,148 @@ IMPORTANT CONTEXT HANDLING:
     this.initializeAutoConnect();
   }
 
+  // ADD: Smart query classification for token optimization
+  private classifyQuery(query: string): 'greeting' | 'simple' | 'business' | 'complex' {
+    const lowerQuery = query.toLowerCase().trim();
+    
+    // Greetings and social interactions (highest token savings)
+    const greetings = [
+      'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
+      'thanks', 'thank you', 'ty', 'thx', 'bye', 'goodbye', 'see you', 'later',
+      'how are you', 'whats up', 'wassup', 'morning', 'evening'
+    ];
+    if (greetings.some(greeting => lowerQuery.includes(greeting)) && lowerQuery.length < 50) {
+      return 'greeting';
+    }
+    
+    // Simple questions and help requests
+    const simplePatterns = [
+      'what can you do', 'help me', 'what is', 'who are you', 'how do i',
+      'can you help', 'what are your capabilities', 'what tools', 'how does this work'
+    ];
+    if (simplePatterns.some(pattern => lowerQuery.includes(pattern)) && lowerQuery.length < 100) {
+      return 'simple';
+    }
+    
+    // Business queries that need tools
+    const businessKeywords = [
+      'customer', 'product', 'invoice', 'estimate', 'search', 'find', 'get', 'list', 
+      'show', 'display', 'fetch', 'retrieve', 'lookup', 'details', 'info', 'address',
+      'email', 'phone', 'contact', 'create', 'add', 'update', 'delete'
+    ];
+    if (businessKeywords.some(keyword => lowerQuery.includes(keyword))) {
+      return 'business';
+    }
+    
+    // Complex analysis (multiple steps, comparisons, reports)
+    const complexPatterns = [
+      'compare', 'analyze', 'report', 'calculate', 'multiple', 'all customers who',
+      'send email', 'generate report', 'analysis', 'summary', 'overview', 'dashboard',
+      'export', 'import', 'bulk', 'batch'
+    ];
+    if (complexPatterns.some(pattern => lowerQuery.includes(pattern)) || lowerQuery.length > 150) {
+      return 'complex';
+    }
+    
+    return 'simple';
+  }
+
+  // ADD: Dynamic system prompts for different query types
+  private getSystemPrompt(queryType: string): string {
+    switch (queryType) {
+      case 'greeting':
+        return `You are a friendly business assistant. Respond warmly and briefly to greetings and social interactions. Keep responses short, natural, and conversational.`;
+        
+      case 'simple':
+        return `You are a helpful business assistant. Answer questions naturally and conversationally. Provide helpful information about your capabilities when asked. Only mention specific business tools if directly relevant to the question.`;
+        
+      case 'business':
+        return `You are a business assistant with access to InvoiceMakerPro tools for managing customers, products, invoices, and estimates. Use the appropriate tools to help with business data queries.
+
+IMPORTANT: 
+- Display tool results exactly as provided
+- Use conversation context to resolve pronouns and references automatically
+- Only ask for missing information if it's not available in context`;
+        
+      case 'complex':
+        return this.SYSTEM_PROMPT; // Full prompt for complex tasks
+        
+      default:
+        return this.SYSTEM_PROMPT;
+    }
+  }
+
+  // ADD: Smart tool filtering based on query type and content
+  private getRelevantTools(queryType: string, query: string): AnthropicTool[] {
+    if (queryType === 'greeting' || queryType === 'simple') {
+      return []; // No tools needed for greetings/simple queries
+    }
+    
+    if (queryType === 'business') {
+      // Filter tools based on query content for better token efficiency
+      const lowerQuery = query.toLowerCase();
+      const relevantTools = this.tools.filter(tool => {
+        const toolName = tool.name.toLowerCase();
+        
+        // Customer-related queries
+        if ((lowerQuery.includes('customer') || lowerQuery.includes('client')) && 
+            toolName.includes('customer')) return true;
+            
+        // Product-related queries  
+        if (lowerQuery.includes('product') && toolName.includes('product')) return true;
+        
+        // Invoice-related queries
+        if (lowerQuery.includes('invoice') && toolName.includes('invoice')) return true;
+        
+        // Estimate-related queries
+        if ((lowerQuery.includes('estimate') || lowerQuery.includes('quote')) && 
+            toolName.includes('estimate')) return true;
+            
+        // General search/get operations
+        if ((lowerQuery.includes('search') || lowerQuery.includes('find') || 
+             lowerQuery.includes('get') || lowerQuery.includes('list') ||
+             lowerQuery.includes('show')) && 
+            (toolName.includes('search') || toolName.includes('get') || toolName.includes('list'))) return true;
+            
+        return false;
+      });
+      
+      // If no specific matches, include basic search tools
+      return relevantTools.length > 0 ? relevantTools : 
+             this.tools.filter(tool => tool.name.toLowerCase().includes('search') || 
+                                     tool.name.toLowerCase().includes('list'));
+    }
+    
+    return this.tools; // All tools for complex queries
+  }
+
+  // ADD: Calculate max tokens based on query type
+  private getMaxTokens(queryType: string): number {
+    switch (queryType) {
+      case 'greeting': return 100;
+      case 'simple': return 300;
+      case 'business': return 1500;
+      case 'complex': return 2000;
+      default: return 2000;
+    }
+  }
+
   private async initializeAutoConnect() {
     try {
-      // Get absolute path to MCP server
+      // Get absolute path to MCP server - going up two levels from src directory
       const __filename = fileURLToPath(import.meta.url);
       const __dirname = path.dirname(__filename);
       const serverPath = path.resolve(__dirname, MCP_SERVER_PATH);
       
       console.log('🔄 Attempting auto-connection to MCP server at:', serverPath);
+      
+      // Check if file exists before attempting connection
+      try {
+        await import(serverPath);
+      } catch (error) {
+        throw new Error(`MCP server file not found at ${serverPath}. Please ensure the file exists and the path is correct.`);
+      }
+      
       await this.connectToServer(serverPath);
       console.log('✅ Successfully auto-connected to MCP server');
       this.autoConnectRetries = 0; // Reset retries on successful connection
@@ -182,41 +316,61 @@ IMPORTANT CONTEXT HANDLING:
     }
   }
 
+  // UPDATED: Optimized processQuery with smart classification
   async processQuery(query: string, sessionId: string) {
     if (!this.isConnected) {
       throw new Error("Not connected to MCP server");
     }
 
-    // Add user message to context (the context manager now handles compression automatically)
+    // Classify the query type for optimization
+    const queryType = this.classifyQuery(query);
+    console.log(`🎯 Query classified as: ${queryType} | Length: ${query.length} chars`);
+
+    // Add user message to context
     await this.contextManager.addMessage(sessionId, 'user', query);
 
-    // Generate optimized context for the conversation
-    const toolContext = await this.contextManager.generateToolContext(sessionId, query);
+    // Smart context generation based on query type
+    let contextInfo = '';
+    let toolContext = null;
     
-    // Build contextual information for system prompt using the optimized context
-    let contextInfo = `
+    if (queryType === 'business' || queryType === 'complex') {
+      // Only generate full context for business/complex queries
+      toolContext = await this.contextManager.generateToolContext(sessionId, query);
+      
+      contextInfo = `
 Current conversation context:
 - User intent: ${toolContext.userIntent}
 - Recent queries: ${toolContext.recentQueries.slice(-2).join(', ')}`;
 
-    // Add specific entity context if available
-    const activeEntities = toolContext.activeEntities;
-    if (activeEntities.customerName) {
-      contextInfo += `
+      const activeEntities = toolContext.activeEntities;
+      if (activeEntities.customerName) {
+        contextInfo += `
 - Active customer: ${activeEntities.customerName}${activeEntities.customerId ? ` (ID: ${activeEntities.customerId})` : ''}`;
-    }
-    if (activeEntities.productName) {
-      contextInfo += `
+      }
+      if (activeEntities.productName) {
+        contextInfo += `
 - Active product: ${activeEntities.productName}${activeEntities.productId ? ` (ID: ${activeEntities.productId})` : ''}`;
+      }
     }
 
-    // Enhance system prompt with context
-    const contextualSystemPrompt = `${this.SYSTEM_PROMPT}
-${contextInfo}
+    // Get optimized system prompt and tools
+    const systemPrompt = this.getSystemPrompt(queryType);
+    const relevantTools = this.getRelevantTools(queryType, query);
+    const maxTokens = this.getMaxTokens(queryType);
+    
+    const contextualSystemPrompt = contextInfo ? `${systemPrompt}${contextInfo}
 
 Use this context to provide more relevant and personalized responses. When users use pronouns or references like "he", "his", "that customer", automatically resolve them from the context above.
 
-CRITICAL: When tools return formatted output with sections, headers, bullet points, or structured data, you MUST display it exactly as provided. Never summarize or rewrite formatted tool outputs - show them verbatim.`;
+CRITICAL: When tools return formatted output with sections, headers, bullet points, or structured data, you MUST display it exactly as provided. Never summarize or rewrite formatted tool outputs - show them verbatim.` : systemPrompt;
+
+    // Token optimization logging
+    console.log(`📊 Token optimization applied:
+- Query type: ${queryType}
+- System prompt: ${systemPrompt.length} chars (vs ${this.SYSTEM_PROMPT.length} full)
+- Tools included: ${relevantTools.length}/${this.tools.length}
+- Context info: ${contextInfo.length} chars
+- Max tokens: ${maxTokens}`);
 
     const messages: Anthropic.MessageParam[] = [
       {
@@ -228,13 +382,36 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
     try {
       const response = await this.anthropic.messages.create({
         model: "claude-3-5-sonnet-20241022",
-        max_tokens: 2000,
+        max_tokens: maxTokens,
         system: contextualSystemPrompt,
         messages,
-        tools: this.tools,
+        tools: relevantTools, // Only include relevant tools
       } as any);
 
-      // Handle tool use in a loop to support multi-turn tool interactions
+      // For greetings and simple queries, return immediately (no tool processing needed)
+      if (queryType === 'greeting' || queryType === 'simple') {
+        const textContent = response.content
+          .filter((content: any) => content.type === "text")
+          .map((content: any) => content.text)
+          .join("\n");
+          
+        await this.contextManager.addMessage(
+          sessionId, 
+          'assistant', 
+          textContent || "No response generated."
+        );
+        
+        console.log(`⚡ Fast-tracked ${queryType} query - no tool processing needed`);
+        
+        return {
+          response: textContent || "No response generated.",
+          toolsUsed: [],
+          queryType,
+          tokensOptimized: true
+        };
+      }
+
+      // Continue with tool processing for business/complex queries
       let currentMessages = [...messages];
       let currentResponse = response;
       const toolUsageLog: any[] = [];
@@ -262,7 +439,9 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           
           return {
             response: textContent || "No response generated.",
-            toolsUsed: toolUsageLog
+            toolsUsed: toolUsageLog,
+            queryType,
+            tokensOptimized: true
           };
         }
 
@@ -362,7 +541,9 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           
           return {
             response: verbatimContent,
-            toolsUsed: toolUsageLog
+            toolsUsed: toolUsageLog,
+            queryType,
+            tokensOptimized: true
           };
         }
 
@@ -377,10 +558,10 @@ SPECIAL INSTRUCTION: The tool result includes a [DISPLAY_VERBATIM] flag. You MUS
         // Get Claude's response to the tool results
         currentResponse = await this.anthropic.messages.create({
           model: "claude-3-5-sonnet-20241022",
-          max_tokens: 2000,
+          max_tokens: maxTokens,
           system: finalSystemPrompt,
           messages: currentMessages,
-          tools: this.tools,
+          tools: relevantTools,
         } as any);
       }
     } catch (error: unknown) {
