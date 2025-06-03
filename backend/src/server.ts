@@ -16,11 +16,12 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
   throw new Error("ANTHROPIC_API_KEY is not set");
 }
+
 const allowedOrigins = [
   "https://app.worxstream.io", // ✅ Production frontend
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "http://localhost:4173"
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://localhost:4173"
 ];
 
 const app = express();
@@ -40,7 +41,6 @@ app.use(cors({
   methods: ["GET", "POST"],
   credentials: true
 }));
-
 
 interface AnthropicTool {
   name: string;
@@ -152,34 +152,27 @@ IMPORTANT CONTEXT HANDLING:
       throw new Error("Not connected to MCP server");
     }
 
-    // Add user message to context
+    // Add user message to context (the context manager now handles compression automatically)
     await this.contextManager.addMessage(sessionId, 'user', query);
 
-    // Generate context for the conversation
+    // Generate optimized context for the conversation
     const toolContext = await this.contextManager.generateToolContext(sessionId, query);
     
-    // Extract entities for context information
-    const contextEntities = await this.contextManager['extractEntitiesFromContext'](toolContext);
-    
-    // Build contextual information for system prompt
+    // Build contextual information for system prompt using the optimized context
     let contextInfo = `
 Current conversation context:
 - User intent: ${toolContext.userIntent}
-- Recent queries: ${toolContext.recentQueries.slice(-3).join(', ')}
-- Previous tool results available: ${toolContext.previousResults.length > 0 ? 'Yes' : 'No'}`;
+- Recent queries: ${toolContext.recentQueries.slice(-2).join(', ')}`;
 
     // Add specific entity context if available
-    if (contextEntities.lastCustomerName) {
+    const activeEntities = toolContext.activeEntities;
+    if (activeEntities.customerName) {
       contextInfo += `
-- Last discussed customer: ${contextEntities.lastCustomerName}${contextEntities.lastCustomerId ? ` (ID: ${contextEntities.lastCustomerId})` : ''}`;
+- Active customer: ${activeEntities.customerName}${activeEntities.customerId ? ` (ID: ${activeEntities.customerId})` : ''}`;
     }
-    if (contextEntities.lastProductName) {
+    if (activeEntities.productName) {
       contextInfo += `
-- Last discussed product: ${contextEntities.lastProductName}${contextEntities.lastProductId ? ` (ID: ${contextEntities.lastProductId})` : ''}`;
-    }
-    if (contextEntities.mentionedCustomer) {
-      contextInfo += `
-- Recently mentioned: ${contextEntities.mentionedCustomer}`;
+- Active product: ${activeEntities.productName}${activeEntities.productId ? ` (ID: ${activeEntities.productId})` : ''}`;
     }
 
     // Enhance system prompt with context
@@ -223,7 +216,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
             .map((content: any) => content.text)
             .join("\n");
           
-          // Add assistant response to context
+          // Add assistant response to context (with automatic compression)
           const toolNames = toolUsageLog.map(t => t.name);
           await this.contextManager.addMessage(
             sessionId, 
@@ -250,11 +243,11 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           const toolName = (toolUse as any).name;
           const originalArgs = (toolUse as any).input as { [x: string]: unknown } | undefined;
 
-          // Check cache first
+          // Check cache first using the optimized caching system
           let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
           
           if (!result) {
-            // Enhance tool arguments with context
+            // Enhance tool arguments with context using the new optimized method
             const enhancedArgs = await this.contextManager.enhanceToolArguments(
               sessionId,
               toolName,
@@ -273,11 +266,11 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
               
               console.log("Tool result:", JSON.stringify(result, null, 2));
               
-              // Cache the result (5 minutes for search results, longer for data)
+              // Cache the result using optimized caching (search results cache for 5 min, data for 1 hour)
               const cacheTime = toolName.includes('search') ? 300 : 3600;
               await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
               
-              // Record tool usage in context
+              // Record tool usage in context with automatic compression and summarization
               await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
               
             } catch (error: unknown) {
@@ -290,7 +283,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
               };
             }
           } else {
-            console.log(`Using cached result for ${toolName}`);
+            console.log(`✅ Using cached result for ${toolName}`);
             toolUsageLog.push({ name: toolName, args: originalArgs, cached: true });
           }
           
@@ -323,7 +316,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
             .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
             .join("\n\n");
           
-          // Add assistant response to context
+          // Add assistant response to context with compression
           const toolNames = toolUsageLog.map(t => t.name);
           await this.contextManager.addMessage(
             sessionId, 
@@ -338,13 +331,12 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           };
         }
 
-        // Use special system prompt for verbatim display
+        // Use enhanced system prompt for verbatim display
         let finalSystemPrompt = contextualSystemPrompt;
         if (hasVerbatimFlag) {
           finalSystemPrompt = `${contextualSystemPrompt}
 
-SPECIAL INSTRUCTION: The tool result includes a [DISPLAY_VERBATIM] flag. You MUST preserve all structured data (tables, headings, lists) and ensure it is displayed using professional markdown formatting. You MAY enhance readability using bold labels, spacing, section dividers, and monospace formatting where appropriate. Do NOT alter the actual text or its meaning. Only the [DISPLAY_VERBATIM] tag should be removed.
-`;
+SPECIAL INSTRUCTION: The tool result includes a [DISPLAY_VERBATIM] flag. You MUST preserve all structured data (tables, headings, lists) and ensure it is displayed using professional markdown formatting. You MAY enhance readability using bold labels, spacing, section dividers, and monospace formatting where appropriate. Do NOT alter the actual text or its meaning. Only the [DISPLAY_VERBATIM] tag should be removed.`;
         }
 
         // Get Claude's response to the tool results
@@ -369,6 +361,8 @@ SPECIAL INSTRUCTION: The tool result includes a [DISPLAY_VERBATIM] flag. You MUS
         await this.mcp.close();
         this.isConnected = false;
       }
+      // Clean up the context manager
+      await this.contextManager.cleanup();
     } catch (error) {
       console.error("Error during cleanup:", error);
     }
@@ -396,10 +390,10 @@ io.on('connection', async (socket) => {
   const sessionId = randomUUID();
   socketToSession.set(socket.id, sessionId);
   
-  // Create session in Redis
+  // Create session in Redis with optimized context manager
   await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
   
-  console.log(`Created session ${sessionId} for socket ${socket.id}`);
+  console.log(`✅ Created optimized session ${sessionId} for socket ${socket.id}`);
 
   // Send current connection status
   socket.emit('connection_status', mcpService.getConnectionStatus());
@@ -426,7 +420,7 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // Handle query processing
+  // Handle query processing with optimized context
   socket.on('process_query', async (data) => {
     try {
       const { query, messageId } = data;
@@ -461,7 +455,7 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // Handle context requests
+  // Handle context requests with optimized data
   socket.on('get_context', async (data) => {
     try {
       const sessionId = socketToSession.get(socket.id);
@@ -474,7 +468,8 @@ io.on('connection', async (socket) => {
       socket.emit('context_response', {
         messages: context?.messages || [],
         toolUsage: context?.toolUsageHistory || [],
-        userPreferences: context?.userPreferences || {}
+        userPreferences: context?.userPreferences || {},
+        activeEntities: context?.activeEntities || {}
       });
     } catch (error) {
       socket.emit('context_error', {
@@ -484,11 +479,11 @@ io.on('connection', async (socket) => {
   });
 
   // Handle disconnection
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('Client disconnected:', socket.id);
     const sessionId = socketToSession.get(socket.id);
     if (sessionId) {
-      console.log(`Cleaned up session ${sessionId} for socket ${socket.id}`);
+      console.log(`🧹 Cleaned up session ${sessionId} for socket ${socket.id}`);
       socketToSession.delete(socket.id);
     }
   });
@@ -515,7 +510,11 @@ app.post('/api/connect', async (req, res) => {
 app.post('/api/query', async (req, res) => {
   try {
     const { query } = req.body;
-    const result = await mcpService.processQuery(query, randomUUID());
+    // Create a temporary session for REST API queries
+    const tempSessionId = randomUUID();
+    await mcpService['contextManager'].createSession(tempSessionId, 'rest_api_user');
+    
+    const result = await mcpService.processQuery(query, tempSessionId);
     res.json({ success: true, ...result });
   } catch (error) {
     res.status(500).json({ 
@@ -546,7 +545,8 @@ process.on('SIGTERM', async () => {
 
 const PORT = process.env.PORT || 8080;
 httpServer.listen(PORT, () => {
-  console.log(`MCP Backend Service running on port ${PORT}`);
-  console.log(`WebSocket endpoint: ws://localhost:${PORT}`);
-  console.log(`REST API endpoint: http://localhost:${PORT}/api`);
+  console.log(`🚀 MCP Backend Service running on port ${PORT}`);
+  console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
+  console.log(`🔗 REST API endpoint: http://localhost:${PORT}/api`);
+  console.log(`⚡ Optimized for token efficiency and performance`);
 });
