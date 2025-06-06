@@ -72,19 +72,32 @@ class MCPBackendService {
   private autoConnectRetries: number = 0;
   private maxAutoConnectRetries: number = 3;
 
-  private readonly SYSTEM_PROMPT = `You are a helpful business assistant with access to InvoiceMakerPro tools for managing products, customers, invoices, and estimates. 
+  private readonly SYSTEM_PROMPT = `You are a helpful assistant with access to various tools for managing products, customers, invoices, estimates, and more.
+
+When users ask about available tools or capabilities:
+- List all available tools with their descriptions
+- Explain what each tool does and when to use it
+- Be specific about tool parameters and requirements
+- Provide examples of how to use the tools
+
+For general queries about tools:
+- Explain the tool's purpose and functionality
+- Describe the input parameters and expected output
+- Mention any limitations or requirements
+- Provide usage examples when relevant
+
+For business data queries (products, customers, invoices, estimates):
+- Use the appropriate tools to help users
+- Explain what data you're retrieving and why
+- Format the results clearly and professionally
 
 Be conversational and natural in your responses:
 - For greetings (hello, hi, good morning), respond warmly and briefly
 - For thanks/appreciation, simply say "You're welcome!" or similar
-- For general questions, answer naturally without always pushing tool usage
-- Only mention or suggest tools when the user asks something that would actually benefit from them
 - Keep responses concise for simple interactions
 - Be friendly and human-like, not robotic
 
-When users ask about business data (products, customers, invoices, estimates), then use the appropriate tools to help them.
-
-IMPORTANT: When tools return formatted content (with sections, bullet points, tables, etc.), display that content EXACTLY as provided. DO NOT summarize or rewrite formatted tool outputs. The tools are designed to provide properly formatted, detailed information that should be shown to the user as-is.
+IMPORTANT: When tools return formatted content (with sections, bullet points, tables, etc.), display that content EXACTLY as provided. DO NOT summarize or rewrite formatted tool outputs.
 
 You have access to conversation context and can reference previous interactions. Use this context to:
 - Provide more relevant responses based on recent conversations
@@ -183,13 +196,20 @@ IMPORTANT:
 
   // ADD: Smart tool filtering based on query type and content
   private getRelevantTools(queryType: string, query: string): AnthropicTool[] {
+    const lowerQuery = query.toLowerCase();
+    
+    // Always return all tools for tool-related queries
+    if (lowerQuery.includes('tool') || lowerQuery.includes('capability') || 
+        lowerQuery.includes('what can you do') || lowerQuery.includes('help')) {
+      return this.tools;
+    }
+    
     if (queryType === 'greeting' || queryType === 'simple') {
       return []; // No tools needed for greetings/simple queries
     }
     
     if (queryType === 'business') {
       // Filter tools based on query content for better token efficiency
-      const lowerQuery = query.toLowerCase();
       const relevantTools = this.tools.filter(tool => {
         const toolName = tool.name.toLowerCase();
         
