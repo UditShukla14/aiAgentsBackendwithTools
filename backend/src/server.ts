@@ -561,203 +561,440 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
   }
 
   // Helper method to handle tool calls with streaming
-  private async processToolCallsWithStreaming(
-    toolCalls: any[],
-    initialContent: string,
-    currentMessages: Anthropic.MessageParam[],
-    systemPrompt: string,
-    relevantTools: AnthropicTool[],
-    maxTokens: number,
-    sessionId: string,
-    originalQuery: string,
-    onChunk: (chunk: any) => void
-  ) {
-    const toolUsageLog: any[] = [];
+// Helper method to handle tool calls with streaming - UPDATED
+private async processToolCallsWithStreaming(
+  toolCalls: any[],
+  initialContent: string,
+  currentMessages: Anthropic.MessageParam[],
+  systemPrompt: string,
+  relevantTools: AnthropicTool[],
+  maxTokens: number,
+  sessionId: string,
+  originalQuery: string,
+  onChunk: (chunk: any) => void
+) {
+  const toolUsageLog: any[] = [];
 
-    // Add the assistant's response with tool calls to the conversation
-    const assistantContent: any[] = [];
-    if (initialContent) {
-      assistantContent.push({
-        type: "text",
-        text: initialContent
-      });
-    }
+  // Add the assistant's response with tool calls to the conversation
+  const assistantContent: any[] = [];
+  if (initialContent) {
+    assistantContent.push({
+      type: "text",
+      text: initialContent
+    });
+  }
+  
+  // Add tool calls to the content
+  for (const toolCall of toolCalls) {
+    assistantContent.push({
+      type: "tool_use",
+      id: toolCall.id,
+      name: toolCall.name,
+      input: toolCall.input
+    });
+  }
+
+  currentMessages.push({
+    role: "assistant",
+    content: assistantContent,
+  });
+
+  // Process each tool call
+  const toolResults: any[] = [];
+  for (const toolCall of toolCalls) {
+    const toolName = toolCall.name;
+    const originalArgs = toolCall.input;
+
+    onChunk({
+      type: 'tool_executing',
+      tool: toolName,
+      args: originalArgs
+    });
+
+    // Check cache first
+    let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
     
-    // Add tool calls to the content
-    for (const toolCall of toolCalls) {
-      assistantContent.push({
-        type: "tool_use",
-        id: toolCall.id,
-        name: toolCall.name,
-        input: toolCall.input
-      });
-    }
-
-    currentMessages.push({
-      role: "assistant",
-      content: assistantContent,
-    });
-
-    // Process each tool call
-    const toolResults: any[] = [];
-    for (const toolCall of toolCalls) {
-      const toolName = toolCall.name;
-      const originalArgs = toolCall.input;
-
-      onChunk({
-        type: 'tool_executing',
-        tool: toolName,
-        args: originalArgs
-      });
-
-      // Check cache first
-      let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
-      
-      if (!result) {
-        // Enhance tool arguments with context
-        const enhancedArgs = await this.contextManager.enhanceToolArguments(
-          sessionId,
-          toolName,
-          originalArgs || {},
-          originalQuery
-        );
-
-        console.log(`🧠 Context: Tool ${toolName} enhanced arguments:`, JSON.stringify(enhancedArgs, null, 2));
-        toolUsageLog.push({ name: toolName, args: enhancedArgs });
-        
-        try {
-          result = await this.mcp.callTool({
-            name: toolName,
-            arguments: enhancedArgs,
-          });
-          
-          console.log("Tool result:", JSON.stringify(result, null, 2));
-          
-          // Cache the result
-          const cacheTime = toolName.includes('search') ? 300 : 3600;
-          await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
-          
-          // Record tool usage in context
-          await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
-          
-        } catch (error: unknown) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          console.error(`Error calling tool ${toolName}:`, error);
-          
-          result = {
-            content: [{ type: "text", text: `Error: ${errorMessage}` }],
-            isError: true
-          };
-        }
-      } else {
-        console.log(`✅ Using cached result for ${toolName}`);
-        toolUsageLog.push({ name: toolName, args: originalArgs, cached: true });
-      }
-
-      onChunk({
-        type: 'tool_result',
-        tool: toolName,
-        result: result.content || [{ type: "text", text: JSON.stringify(result) }],
-        cached: !!result.cached
-      });
-      
-      toolResults.push({
-        type: "tool_result",
-        tool_use_id: toolCall.id,
-        content: result.content || [{ type: "text", text: JSON.stringify(result) }],
-        is_error: result.isError || false,
-      });
-    }
-
-    // Add tool results to the conversation
-    currentMessages.push({
-      role: "user",
-      content: toolResults,
-    });
-
-    // Check if any tool result has DISPLAY_VERBATIM flag
-    const hasVerbatimFlag = toolResults.some(result => 
-      result.content.some((content: any) => 
-        content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")
-      )
-    );
-
-    // For verbatim content, bypass Claude and return directly
-    if (hasVerbatimFlag) {
-      const verbatimContent = toolResults
-        .flatMap(result => result.content)
-        .filter((content: any) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
-        .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
-        .join("\n\n");
-      
-      // Stream the verbatim content
-      const lines = verbatimContent.split('\n');
-      let accumulated = '';
-      
-      for (const line of lines) {
-        accumulated += line + '\n';
-        onChunk({
-          type: 'text_delta',
-          delta: line + '\n',
-          accumulated: accumulated.trim(),
-          isVerbatim: true
-        });
-        await new Promise(resolve => setTimeout(resolve, 10));
-      }
-      
-      await this.contextManager.addMessage(
-        sessionId, 
-        'assistant', 
-        verbatimContent,
-        toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+    if (!result) {
+      // Enhance tool arguments with context
+      const enhancedArgs = await this.contextManager.enhanceToolArguments(
+        sessionId,
+        toolName,
+        originalArgs || {},
+        originalQuery
       );
+
+      console.log(`🧠 Context: Tool ${toolName} enhanced arguments:`, JSON.stringify(enhancedArgs, null, 2));
+      toolUsageLog.push({ name: toolName, args: enhancedArgs });
       
-      onChunk({
-        type: 'complete',
-        response: verbatimContent,
-        toolsUsed: toolUsageLog
-      });
-      return;
-    }
-
-    // Get Claude's streaming response to the tool results
-    const finalResponse = await this.anthropic.messages.create({
-      model: "claude-3-5-sonnet-20241022",
-      max_tokens: maxTokens,
-      system: systemPrompt,
-      messages: currentMessages,
-      tools: relevantTools,
-      stream: true,
-    } as any);
-
-    let finalContent = '';
-    
-    // Stream the final response
-    for await (const chunk of finalResponse as any) {
-      if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
-        finalContent += chunk.delta.text;
-        onChunk({
-          type: 'text_delta',
-          delta: chunk.delta.text,
-          accumulated: finalContent,
-          isFinal: true
+      try {
+        result = await this.mcp.callTool({
+          name: toolName,
+          arguments: enhancedArgs,
         });
+        
+        console.log("Tool result:", JSON.stringify(result, null, 2));
+        
+        // Cache the result
+        const cacheTime = toolName.includes('search') ? 300 : 3600;
+        await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+        
+        // Record tool usage in context
+        await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
+        
+      } catch (error: unknown) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        console.error(`Error calling tool ${toolName}:`, error);
+        
+        result = {
+          content: [{ type: "text", text: `Error: ${errorMessage}` }],
+          isError: true
+        };
       }
+    } else {
+      console.log(`✅ Using cached result for ${toolName}`);
+      toolUsageLog.push({ name: toolName, args: originalArgs, cached: true });
     }
 
+    onChunk({
+      type: 'tool_result',
+      tool: toolName,
+      result: result.content || [{ type: "text", text: JSON.stringify(result) }],
+      cached: !!result.cached
+    });
+    
+    toolResults.push({
+      type: "tool_result",
+      tool_use_id: toolCall.id,
+      content: result.content || [{ type: "text", text: JSON.stringify(result) }],
+      is_error: result.isError || false,
+    });
+  }
+
+  // Add tool results to the conversation
+  currentMessages.push({
+    role: "user",
+    content: toolResults,
+  });
+
+  // Check if any tool result has DISPLAY_VERBATIM flag
+  const hasVerbatimFlag = toolResults.some(result => 
+    result.content.some((content: any) => 
+      content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")
+    )
+  );
+
+  // For verbatim content, bypass Claude and return directly
+  if (hasVerbatimFlag) {
+    const verbatimContent = toolResults
+      .flatMap(result => result.content)
+      .filter((content: any) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
+      .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
+      .join("\n\n");
+    
+    // Stream the verbatim content
+    const lines = verbatimContent.split('\n');
+    let accumulated = '';
+    
+    for (const line of lines) {
+      accumulated += line + '\n';
+      onChunk({
+        type: 'text_delta',
+        delta: line + '\n',
+        accumulated: accumulated.trim(),
+        isVerbatim: true
+      });
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    
     await this.contextManager.addMessage(
       sessionId, 
       'assistant', 
-      finalContent || "No response generated.",
+      verbatimContent,
       toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
     );
     
     onChunk({
       type: 'complete',
-      response: finalContent || "No response generated.",
+      response: verbatimContent,
       toolsUsed: toolUsageLog
     });
+    return;
   }
+
+  // **CRITICAL FIX: Continue processing iteratively like the non-streaming version**
+  await this.continueStreamingConversation(
+    currentMessages,
+    systemPrompt,
+    relevantTools,
+    maxTokens,
+    sessionId,
+    originalQuery,
+    toolUsageLog,
+    onChunk
+  );
+}
+
+// **NEW METHOD: Handle iterative conversation with streaming**
+private async continueStreamingConversation(
+  currentMessages: Anthropic.MessageParam[],
+  systemPrompt: string,
+  relevantTools: AnthropicTool[],
+  maxTokens: number,
+  sessionId: string,
+  originalQuery: string,
+  toolUsageLog: any[],
+  onChunk: (chunk: any) => void
+) {
+  while (true) {
+    try {
+      // Get Claude's streaming response to the tool results
+      const response = await this.anthropic.messages.create({
+        model: "claude-3-5-sonnet-20241022",
+        max_tokens: maxTokens,
+        system: systemPrompt,
+        messages: currentMessages,
+        tools: relevantTools,
+        stream: true,
+      } as any);
+
+      let streamedContent = '';
+      let newToolCalls: any[] = [];
+      let currentToolCall: any = null;
+
+      // Handle streaming response
+      for await (const chunk of response as any) {
+        if (chunk.type === 'content_block_start') {
+          if (chunk.content_block.type === 'text') {
+            // Text content starting
+          } else if (chunk.content_block.type === 'tool_use') {
+            currentToolCall = {
+              id: chunk.content_block.id,
+              name: chunk.content_block.name,
+              input: {}
+            };
+            onChunk({
+              type: 'tool_start',
+              tool: {
+                name: chunk.content_block.name,
+                id: chunk.content_block.id
+              }
+            });
+          }
+        } else if (chunk.type === 'content_block_delta') {
+          if (chunk.delta.type === 'text_delta') {
+            streamedContent += chunk.delta.text;
+            onChunk({
+              type: 'text_delta',
+              delta: chunk.delta.text,
+              accumulated: streamedContent
+            });
+          } else if (chunk.delta.type === 'input_json_delta') {
+            if (currentToolCall) {
+              try {
+                const partialInput = JSON.parse((currentToolCall.inputJson || '') + chunk.delta.partial_json);
+                currentToolCall.input = partialInput;
+              } catch (e) {
+                // JSON might be incomplete, store for next chunk
+                currentToolCall.inputJson = (currentToolCall.inputJson || '') + chunk.delta.partial_json;
+              }
+            }
+            onChunk({
+              type: 'tool_input_delta',
+              delta: chunk.delta.partial_json
+            });
+          }
+        } else if (chunk.type === 'content_block_stop') {
+          if (currentToolCall) {
+            try {
+              if (currentToolCall.inputJson) {
+                currentToolCall.input = JSON.parse(currentToolCall.inputJson);
+              }
+            } catch (e) {
+              console.error('Failed to parse tool input JSON:', e);
+            }
+            newToolCalls.push(currentToolCall);
+            currentToolCall = null;
+          }
+        } else if (chunk.type === 'message_stop') {
+          break;
+        }
+      }
+
+      // If no more tool calls, we're done
+      if (newToolCalls.length === 0) {
+        // Final response - save to context and complete
+        await this.contextManager.addMessage(
+          sessionId, 
+          'assistant', 
+          streamedContent || "No response generated.",
+          toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+        );
+        
+        onChunk({
+          type: 'complete',
+          response: streamedContent || "No response generated.",
+          toolsUsed: toolUsageLog
+        });
+        return;
+      }
+
+      // Add the assistant's response with new tool calls to the conversation
+      const assistantContent: any[] = [];
+      if (streamedContent) {
+        assistantContent.push({
+          type: "text",
+          text: streamedContent
+        });
+      }
+      
+      // Add new tool calls to the content
+      for (const toolCall of newToolCalls) {
+        assistantContent.push({
+          type: "tool_use",
+          id: toolCall.id,
+          name: toolCall.name,
+          input: toolCall.input
+        });
+      }
+
+      currentMessages.push({
+        role: "assistant",
+        content: assistantContent,
+      });
+
+      // Process the new tool calls
+      const toolResults: any[] = [];
+      for (const toolCall of newToolCalls) {
+        const toolName = toolCall.name;
+        const originalArgs = toolCall.input;
+
+        onChunk({
+          type: 'tool_executing',
+          tool: toolName,
+          args: originalArgs
+        });
+
+        // Check cache first
+        let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
+        
+        if (!result) {
+          // Enhance tool arguments with context
+          const enhancedArgs = await this.contextManager.enhanceToolArguments(
+            sessionId,
+            toolName,
+            originalArgs || {},
+            originalQuery
+          );
+
+          console.log(`🧠 Context: Tool ${toolName} enhanced arguments:`, JSON.stringify(enhancedArgs, null, 2));
+          toolUsageLog.push({ name: toolName, args: enhancedArgs });
+          
+          try {
+            result = await this.mcp.callTool({
+              name: toolName,
+              arguments: enhancedArgs,
+            });
+            
+            console.log("Tool result:", JSON.stringify(result, null, 2));
+            
+            // Cache the result
+            const cacheTime = toolName.includes('search') ? 300 : 3600;
+            await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+            
+            // Record tool usage in context
+            await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
+            
+          } catch (error: unknown) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            console.error(`Error calling tool ${toolName}:`, error);
+            
+            result = {
+              content: [{ type: "text", text: `Error: ${errorMessage}` }],
+              isError: true
+            };
+          }
+        } else {
+          console.log(`✅ Using cached result for ${toolName}`);
+          toolUsageLog.push({ name: toolName, args: originalArgs, cached: true });
+        }
+
+        onChunk({
+          type: 'tool_result',
+          tool: toolName,
+          result: result.content || [{ type: "text", text: JSON.stringify(result) }],
+          cached: !!result.cached
+        });
+        
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolCall.id,
+          content: result.content || [{ type: "text", text: JSON.stringify(result) }],
+          is_error: result.isError || false,
+        });
+      }
+
+      // Add tool results to the conversation
+      currentMessages.push({
+        role: "user",
+        content: toolResults,
+      });
+
+      // Check for verbatim content
+      const hasVerbatimFlag = toolResults.some(result => 
+        result.content.some((content: any) => 
+          content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")
+        )
+      );
+
+      if (hasVerbatimFlag) {
+        const verbatimContent = toolResults
+          .flatMap(result => result.content)
+          .filter((content: any) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
+          .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
+          .join("\n\n");
+        
+        // Stream the verbatim content
+        const lines = verbatimContent.split('\n');
+        let accumulated = '';
+        
+        for (const line of lines) {
+          accumulated += line + '\n';
+          onChunk({
+            type: 'text_delta',
+            delta: line + '\n',
+            accumulated: accumulated.trim(),
+            isVerbatim: true
+          });
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        
+        await this.contextManager.addMessage(
+          sessionId, 
+          'assistant', 
+          verbatimContent,
+          toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+        );
+        
+        onChunk({
+          type: 'complete',
+          response: verbatimContent,
+          toolsUsed: toolUsageLog
+        });
+        return;
+      }
+
+      // Continue the loop to handle the next iteration
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error("Error in streaming conversation:", error);
+      onChunk({
+        type: 'error',
+        error: `Error in conversation: ${errorMessage}`
+      });
+      return;
+    }
+  }
+}
 
   // ORIGINAL: Non-streaming version (kept for compatibility)
   async processQuery(query: string, sessionId: string) {
