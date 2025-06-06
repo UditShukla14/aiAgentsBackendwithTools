@@ -25,7 +25,6 @@ const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || (
     : path.resolve(__dirname, '../../mcp-server/mcp-server.ts')
 );
 
-
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
   throw new Error("ANTHROPIC_API_KEY is not set");
@@ -55,6 +54,8 @@ app.use(cors({
   methods: ["GET", "POST"],
   credentials: true
 }));
+
+app.use(express.json());
 
 interface AnthropicTool {
   name: string;
@@ -123,7 +124,7 @@ IMPORTANT CONTEXT HANDLING:
     this.initializeAutoConnect();
   }
 
-  // ADD: Smart query classification for token optimization
+  // Smart query classification for token optimization
   private classifyQuery(query: string): 'greeting' | 'simple' | 'business' | 'complex' {
     const lowerQuery = query.toLowerCase().trim();
     
@@ -169,7 +170,7 @@ IMPORTANT CONTEXT HANDLING:
     return 'simple';
   }
 
-  // ADD: Dynamic system prompts for different query types
+  // Dynamic system prompts for different query types
   private getSystemPrompt(queryType: string): string {
     switch (queryType) {
       case 'greeting':
@@ -194,7 +195,7 @@ IMPORTANT:
     }
   }
 
-  // ADD: Smart tool filtering based on query type and content
+  // Smart tool filtering based on query type and content
   private getRelevantTools(queryType: string, query: string): AnthropicTool[] {
     const lowerQuery = query.toLowerCase();
     
@@ -245,7 +246,7 @@ IMPORTANT:
     return this.tools; // All tools for complex queries
   }
 
-  // ADD: Calculate max tokens based on query type
+  // Calculate max tokens based on query type
   private getMaxTokens(queryType: string): number {
     switch (queryType) {
       case 'greeting': return 100;
@@ -285,7 +286,6 @@ IMPORTANT:
       }
     }
   }
-  
 
   async connectToServer(serverScriptPath: string) {
     try {
@@ -343,13 +343,428 @@ IMPORTANT:
     }
   }
 
-  // UPDATED: Optimized processQuery with smart classification
+  // NEW: Streaming version of processQuery
+  async processQueryStream(query: string, sessionId: string, onChunk: (chunk: any) => void) {
+    if (!this.isConnected) {
+      throw new Error("Not connected to MCP server");
+    }
+
+    const queryType = this.classifyQuery(query);
+    console.log(`🎯 Query classified as: ${queryType} | Length: ${query.length} chars`);
+
+    // Add user message to context
+    await this.contextManager.addMessage(sessionId, 'user', query);
+
+    // Smart context generation based on query type
+    let contextInfo = '';
+    let toolContext = null;
+    
+    if (queryType === 'business' || queryType === 'complex') {
+      // Only generate full context for business/complex queries
+      toolContext = await this.contextManager.generateToolContext(sessionId, query);
+      
+      contextInfo = `
+Current conversation context:
+- User intent: ${toolContext.userIntent}
+- Recent queries: ${toolContext.recentQueries.slice(-2).join(', ')}`;
+
+      const activeEntities = toolContext.activeEntities;
+      if (activeEntities.customerName) {
+        contextInfo += `
+- Active customer: ${activeEntities.customerName}${activeEntities.customerId ? ` (ID: ${activeEntities.customerId})` : ''}`;
+      }
+      if (activeEntities.productName) {
+        contextInfo += `
+- Active product: ${activeEntities.productName}${activeEntities.productId ? ` (ID: ${activeEntities.productId})` : ''}`;
+      }
+    }
+
+    // Get optimized system prompt and tools
+    const systemPrompt = this.getSystemPrompt(queryType);
+    const relevantTools = this.getRelevantTools(queryType, query);
+    const maxTokens = this.getMaxTokens(queryType);
+    
+    const contextualSystemPrompt = contextInfo ? `${systemPrompt}${contextInfo}
+
+Use this context to provide more relevant and personalized responses. When users use pronouns or references like "he", "his", "that customer", automatically resolve them from the context above.
+
+CRITICAL: When tools return formatted output with sections, headers, bullet points, or structured data, you MUST display it exactly as provided. Never summarize or rewrite formatted tool outputs - show them verbatim.` : systemPrompt;
+
+    // Token optimization logging
+    console.log(`📊 Token optimization applied:
+- Query type: ${queryType}
+- System prompt: ${systemPrompt.length} chars (vs ${this.SYSTEM_PROMPT.length} full)
+- Tools included: ${relevantTools.length}/${this.tools.length}
+- Context info: ${contextInfo.length} chars
+- Max tokens: ${maxTokens}`);
+
+    const messages: Anthropic.MessageParam[] = [
+      {
+        role: "user",
+        content: query,
+      },
+    ];
+
+    try {
+      onChunk({
+        type: 'query_start',
+        queryType,
+        tokensOptimized: true,
+        toolsAvailable: relevantTools.length
+      });
+
+      // Use streaming for the initial response
+      const response = await this.anthropic.messages.create({
+        model: "claude-3-5-sonnet-20241022",
+        max_tokens: maxTokens,
+        system: contextualSystemPrompt,
+        messages,
+        tools: relevantTools,
+        stream: true,
+      } as any);
+
+      let streamedContent = '';
+      let toolCalls: any[] = [];
+      let currentToolCall: any = null;
+
+      // Handle streaming response
+      for await (const chunk of response as any) {
+        if (chunk.type === 'message_start') {
+          onChunk({
+            type: 'message_start',
+            queryType,
+            tokensOptimized: true
+          });
+        } else if (chunk.type === 'content_block_start') {
+          if (chunk.content_block.type === 'text') {
+            onChunk({
+              type: 'content_start',
+              contentType: 'text'
+            });
+          } else if (chunk.content_block.type === 'tool_use') {
+            currentToolCall = {
+              id: chunk.content_block.id,
+              name: chunk.content_block.name,
+              input: {}
+            };
+            onChunk({
+              type: 'tool_start',
+              tool: {
+                name: chunk.content_block.name,
+                id: chunk.content_block.id
+              }
+            });
+          }
+        } else if (chunk.type === 'content_block_delta') {
+          if (chunk.delta.type === 'text_delta') {
+            streamedContent += chunk.delta.text;
+            onChunk({
+              type: 'text_delta',
+              delta: chunk.delta.text,
+              accumulated: streamedContent
+            });
+          } else if (chunk.delta.type === 'input_json_delta') {
+            if (currentToolCall) {
+              try {
+                const partialInput = JSON.parse(currentToolCall.inputJson + chunk.delta.partial_json);
+                currentToolCall.input = partialInput;
+              } catch (e) {
+                // JSON might be incomplete, store for next chunk
+                currentToolCall.inputJson = (currentToolCall.inputJson || '') + chunk.delta.partial_json;
+              }
+            }
+            onChunk({
+              type: 'tool_input_delta',
+              delta: chunk.delta.partial_json
+            });
+          }
+        } else if (chunk.type === 'content_block_stop') {
+          if (currentToolCall) {
+            try {
+              if (currentToolCall.inputJson) {
+                currentToolCall.input = JSON.parse(currentToolCall.inputJson);
+              }
+            } catch (e) {
+              console.error('Failed to parse tool input JSON:', e);
+            }
+            toolCalls.push(currentToolCall);
+            currentToolCall = null;
+          }
+        } else if (chunk.type === 'message_delta') {
+          if (chunk.delta.stop_reason) {
+            onChunk({
+              type: 'message_delta',
+              stopReason: chunk.delta.stop_reason
+            });
+          }
+        } else if (chunk.type === 'message_stop') {
+          break;
+        }
+      }
+
+      // For greetings and simple queries, finish here
+      if (queryType === 'greeting' || queryType === 'simple') {
+        await this.contextManager.addMessage(
+          sessionId, 
+          'assistant', 
+          streamedContent || "No response generated."
+        );
+        
+        onChunk({
+          type: 'complete',
+          response: streamedContent || "No response generated.",
+          toolsUsed: [],
+          queryType,
+          tokensOptimized: true
+        });
+        return;
+      }
+
+      // If there are tool calls, process them
+      if (toolCalls.length > 0) {
+        await this.processToolCallsWithStreaming(
+          toolCalls,
+          streamedContent,
+          messages,
+          contextualSystemPrompt,
+          relevantTools,
+          maxTokens,
+          sessionId,
+          query,
+          onChunk
+        );
+      } else {
+        // No tool calls, just return the streamed content
+        await this.contextManager.addMessage(
+          sessionId, 
+          'assistant', 
+          streamedContent || "No response generated."
+        );
+        
+        onChunk({
+          type: 'complete',
+          response: streamedContent || "No response generated.",
+          toolsUsed: [],
+          queryType,
+          tokensOptimized: true
+        });
+      }
+
+    } catch (error: unknown) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      console.error("Error processing query:", error);
+      onChunk({
+        type: 'error',
+        error: `Error processing query: ${errorMessage}`
+      });
+    }
+  }
+
+  // Helper method to handle tool calls with streaming
+  private async processToolCallsWithStreaming(
+    toolCalls: any[],
+    initialContent: string,
+    currentMessages: Anthropic.MessageParam[],
+    systemPrompt: string,
+    relevantTools: AnthropicTool[],
+    maxTokens: number,
+    sessionId: string,
+    originalQuery: string,
+    onChunk: (chunk: any) => void
+  ) {
+    const toolUsageLog: any[] = [];
+
+    // Add the assistant's response with tool calls to the conversation
+    const assistantContent: any[] = [];
+    if (initialContent) {
+      assistantContent.push({
+        type: "text",
+        text: initialContent
+      });
+    }
+    
+    // Add tool calls to the content
+    for (const toolCall of toolCalls) {
+      assistantContent.push({
+        type: "tool_use",
+        id: toolCall.id,
+        name: toolCall.name,
+        input: toolCall.input
+      });
+    }
+
+    currentMessages.push({
+      role: "assistant",
+      content: assistantContent,
+    });
+
+    // Process each tool call
+    const toolResults: any[] = [];
+    for (const toolCall of toolCalls) {
+      const toolName = toolCall.name;
+      const originalArgs = toolCall.input;
+
+      onChunk({
+        type: 'tool_executing',
+        tool: toolName,
+        args: originalArgs
+      });
+
+      // Check cache first
+      let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
+      
+      if (!result) {
+        // Enhance tool arguments with context
+        const enhancedArgs = await this.contextManager.enhanceToolArguments(
+          sessionId,
+          toolName,
+          originalArgs || {},
+          originalQuery
+        );
+
+        console.log(`🧠 Context: Tool ${toolName} enhanced arguments:`, JSON.stringify(enhancedArgs, null, 2));
+        toolUsageLog.push({ name: toolName, args: enhancedArgs });
+        
+        try {
+          result = await this.mcp.callTool({
+            name: toolName,
+            arguments: enhancedArgs,
+          });
+          
+          console.log("Tool result:", JSON.stringify(result, null, 2));
+          
+          // Cache the result
+          const cacheTime = toolName.includes('search') ? 300 : 3600;
+          await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+          
+          // Record tool usage in context
+          await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
+          
+        } catch (error: unknown) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          console.error(`Error calling tool ${toolName}:`, error);
+          
+          result = {
+            content: [{ type: "text", text: `Error: ${errorMessage}` }],
+            isError: true
+          };
+        }
+      } else {
+        console.log(`✅ Using cached result for ${toolName}`);
+        toolUsageLog.push({ name: toolName, args: originalArgs, cached: true });
+      }
+
+      onChunk({
+        type: 'tool_result',
+        tool: toolName,
+        result: result.content || [{ type: "text", text: JSON.stringify(result) }],
+        cached: !!result.cached
+      });
+      
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: toolCall.id,
+        content: result.content || [{ type: "text", text: JSON.stringify(result) }],
+        is_error: result.isError || false,
+      });
+    }
+
+    // Add tool results to the conversation
+    currentMessages.push({
+      role: "user",
+      content: toolResults,
+    });
+
+    // Check if any tool result has DISPLAY_VERBATIM flag
+    const hasVerbatimFlag = toolResults.some(result => 
+      result.content.some((content: any) => 
+        content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")
+      )
+    );
+
+    // For verbatim content, bypass Claude and return directly
+    if (hasVerbatimFlag) {
+      const verbatimContent = toolResults
+        .flatMap(result => result.content)
+        .filter((content: any) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
+        .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
+        .join("\n\n");
+      
+      // Stream the verbatim content
+      const lines = verbatimContent.split('\n');
+      let accumulated = '';
+      
+      for (const line of lines) {
+        accumulated += line + '\n';
+        onChunk({
+          type: 'text_delta',
+          delta: line + '\n',
+          accumulated: accumulated.trim(),
+          isVerbatim: true
+        });
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      
+      await this.contextManager.addMessage(
+        sessionId, 
+        'assistant', 
+        verbatimContent,
+        toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+      );
+      
+      onChunk({
+        type: 'complete',
+        response: verbatimContent,
+        toolsUsed: toolUsageLog
+      });
+      return;
+    }
+
+    // Get Claude's streaming response to the tool results
+    const finalResponse = await this.anthropic.messages.create({
+      model: "claude-3-5-sonnet-20241022",
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: currentMessages,
+      tools: relevantTools,
+      stream: true,
+    } as any);
+
+    let finalContent = '';
+    
+    // Stream the final response
+    for await (const chunk of finalResponse as any) {
+      if (chunk.type === 'content_block_delta' && chunk.delta.type === 'text_delta') {
+        finalContent += chunk.delta.text;
+        onChunk({
+          type: 'text_delta',
+          delta: chunk.delta.text,
+          accumulated: finalContent,
+          isFinal: true
+        });
+      }
+    }
+
+    await this.contextManager.addMessage(
+      sessionId, 
+      'assistant', 
+      finalContent || "No response generated.",
+      toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+    );
+    
+    onChunk({
+      type: 'complete',
+      response: finalContent || "No response generated.",
+      toolsUsed: toolUsageLog
+    });
+  }
+
+  // ORIGINAL: Non-streaming version (kept for compatibility)
   async processQuery(query: string, sessionId: string) {
     if (!this.isConnected) {
       throw new Error("Not connected to MCP server");
     }
 
-    // Classify the query type for optimization
     const queryType = this.classifyQuery(query);
     console.log(`🎯 Query classified as: ${queryType} | Length: ${query.length} chars`);
 
@@ -412,7 +827,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
         max_tokens: maxTokens,
         system: contextualSystemPrompt,
         messages,
-        tools: relevantTools, // Only include relevant tools
+        tools: relevantTools,
       } as any);
 
       // For greetings and simple queries, return immediately (no tool processing needed)
@@ -574,19 +989,11 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           };
         }
 
-        // Use enhanced system prompt for verbatim display
-        let finalSystemPrompt = contextualSystemPrompt;
-        if (hasVerbatimFlag) {
-          finalSystemPrompt = `${contextualSystemPrompt}
-
-SPECIAL INSTRUCTION: The tool result includes a [DISPLAY_VERBATIM] flag. You MUST preserve all structured data (tables, headings, lists) and ensure it is displayed using professional markdown formatting. You MAY enhance readability using bold labels, spacing, section dividers, and monospace formatting where appropriate. Do NOT alter the actual text or its meaning. Only the [DISPLAY_VERBATIM] tag should be removed.`;
-        }
-
         // Get Claude's response to the tool results
         currentResponse = await this.anthropic.messages.create({
           model: "claude-3-5-sonnet-20241022",
           max_tokens: maxTokens,
-          system: finalSystemPrompt,
+          system: contextualSystemPrompt,
           messages: currentMessages,
           tools: relevantTools,
         } as any);
@@ -672,7 +1079,43 @@ io.on('connection', async (socket) => {
     }
   });
 
-  // Handle query processing with optimized context
+  // NEW: Handle streaming query processing
+  socket.on('process_query_stream', async (data) => {
+    try {
+      const { query, messageId } = data;
+      const sessionId = socketToSession.get(socket.id);
+      
+      if (!sessionId) {
+        socket.emit('query_error', {
+          messageId,
+          message: 'Session not found. Please refresh the page.'
+        });
+        return;
+      }
+      
+      socket.emit('query_progress', { 
+        messageId, 
+        status: 'processing', 
+        message: 'Processing your query...' 
+      });
+      
+      // Use streaming version
+      await mcpService.processQueryStream(query, sessionId, (chunk) => {
+        socket.emit('query_stream', {
+          messageId,
+          chunk
+        });
+      });
+      
+    } catch (error) {
+      socket.emit('query_error', {
+        messageId: data.messageId,
+        message: error instanceof Error ? error.message : 'Failed to process query'
+      });
+    }
+  });
+
+  // KEEP: Original non-streaming handler for backward compatibility
   socket.on('process_query', async (data) => {
     try {
       const { query, messageId } = data;
@@ -781,6 +1224,41 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// NEW: Server-Sent Events endpoint for streaming
+app.get('/api/query-stream', async (req, res) => {
+  const { query } = req.query as { query: string };
+  
+  if (!query) {
+    return res.status(400).json({ error: 'Query parameter is required' });
+  }
+  
+  // Set up SSE headers
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Cache-Control'
+  });
+  
+  const tempSessionId = randomUUID();
+  await mcpService['contextManager'].createSession(tempSessionId, 'sse_user');
+  
+  try {
+    await mcpService.processQueryStream(query, tempSessionId, (chunk) => {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    });
+  } catch (error) {
+    res.write(`data: ${JSON.stringify({ 
+      type: 'error', 
+      error: error instanceof Error ? error.message : 'Unknown error' 
+    })}\n\n`);
+  }
+  
+  res.end();
+});
+
+// KEEP: Original non-streaming query endpoint
 app.post('/api/query', async (req, res) => {
   try {
     const { query } = req.body;
@@ -822,5 +1300,6 @@ httpServer.listen(PORT, () => {
   console.log(`🚀 MCP Backend Service running on port ${PORT}`);
   console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🔗 REST API endpoint: http://localhost:${PORT}/api`);
-  console.log(`⚡ Optimized for token efficiency and performance`);
+  console.log(`⚡ Streaming support enabled for real-time responses`);
+  console.log(`🎯 Optimized for token efficiency and performance`);
 });
