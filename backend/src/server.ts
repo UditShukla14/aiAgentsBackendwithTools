@@ -94,13 +94,15 @@ For business data queries (products, customers, invoices, estimates):
 
 CRITICAL DATE HANDLING:
 - For ANY query that mentions dates, time periods, or time-related words, ALWAYS use the date calculation tool first
-- Use calculateDateRangeFromExpression to convert ANY natural language date expression to exact dates
+- Use date-utility to convert ANY natural language date expression to exact dates
+- This includes simple date questions like "what is 2 weeks before today", "when is tomorrow", etc.
+- NEVER answer date questions directly - ALWAYS use the date tool
 - Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
 - NEVER guess or assume dates - always calculate them properly
 - NEVER use searchEstimateList or searchInvoiceList directly with date expressions
-- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → calculateDateRangeFromExpression(EXPRESSION) → use result with searchEstimateList
-- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", etc.
-- If you see ANY date-related words, you MUST call calculateDateRangeFromExpression first
+- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → date-utility(operation: 'parse', date: EXPRESSION) → use result
+- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", "what is 2 weeks before today", "when is tomorrow", etc.
+- If you see ANY date-related words, you MUST call date-utility with operation 'parse' first
 
 Be conversational and natural in your responses:
 - For greetings (hello, hi, good morning), respond warmly and briefly
@@ -153,9 +155,25 @@ CUSTOMER SEARCH GUIDELINES:
       return 'greeting';
     }
     
-    // Simple questions and help requests
+    // Date-related queries should be business queries to get access to date tools
+    const dateKeywords = [
+      'yesterday', 'today', 'tomorrow', 'last', 'this', 'next', 'past', 'ago',
+      'date', 'time', 'period', 'range', 'week', 'month', 'year', 'days',
+      'quarter', 'decade', 'century', 'morning', 'afternoon', 'evening',
+      'night', 'dawn', 'dusk', 'noon', 'midnight', 'hour', 'minute', 'second',
+      'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+      'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+      'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr',
+      'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'what is', 'when is'
+    ];
+    
+    if (dateKeywords.some(keyword => lowerQuery.includes(keyword))) {
+      return 'business';
+    }
+    
+    // Simple questions and help requests (but not date-related)
     const simplePatterns = [
-      'what can you do', 'help me', 'what is', 'who are you', 'how do i',
+      'what can you do', 'help me', 'who are you', 'how do i',
       'can you help', 'what are your capabilities', 'what tools', 'how does this work'
     ];
     if (simplePatterns.some(pattern => lowerQuery.includes(pattern)) && lowerQuery.length < 100) {
@@ -199,13 +217,15 @@ CUSTOMER SEARCH GUIDELINES:
 
 CRITICAL DATE HANDLING:
 - For ANY query that mentions dates, time periods, or time-related words, ALWAYS use the date calculation tool first
-- Use calculateDateRangeFromExpression to convert ANY natural language date expression to exact dates
+- Use date-utility to convert ANY natural language date expression to exact dates
+- This includes simple date questions like "what is 2 weeks before today", "when is tomorrow", etc.
+- NEVER answer date questions directly - ALWAYS use the date tool
 - Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
 - NEVER guess or assume dates - always calculate them properly
 - NEVER use searchEstimateList or searchInvoiceList directly with date expressions
-- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → calculateDateRangeFromExpression(EXPRESSION) → use result with searchEstimateList
-- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", etc.
-- If you see ANY date-related words, you MUST call calculateDateRangeFromExpression first
+- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → date-utility(operation: 'parse', date: EXPRESSION) → use result
+- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", "what is 2 weeks before today", "when is tomorrow", etc.
+- If you see ANY date-related words, you MUST call date-utility with operation 'parse' first
 
 IMPORTANT: 
 - Display tool results exactly as provided
@@ -257,7 +277,7 @@ CUSTOMER SEARCH GUIDELINES:
         ];
         
         if (dateKeywords.some(keyword => lowerQuery.includes(keyword))) {
-          if (toolName.includes('calculateDateRangeFromExpression')) return true;
+          if (toolName === 'date-utility') return true;
         }
         
         // Customer-related queries
@@ -295,7 +315,7 @@ CUSTOMER SEARCH GUIDELINES:
           const toolName = tool.name.toLowerCase();
           return toolName.includes('search') || 
                  toolName.includes('list') ||
-                 toolName.includes('calculateDateRangeFromExpression');
+                 toolName === 'date-utility';
         });
       }
       
@@ -442,27 +462,26 @@ Current conversation context:
     const systemPrompt = this.getSystemPrompt(queryType);
     const relevantTools = this.getRelevantTools(queryType, query);
     const maxTokens = this.getMaxTokens(queryType);
-    
-    const contextualSystemPrompt = contextInfo ? `${systemPrompt}${contextInfo}
 
-Use this context to provide more relevant and personalized responses. When users use pronouns or references like "he", "his", "that customer", automatically resolve them from the context above.
+    // Build contextual system prompt
+    const contextualSystemPrompt = contextInfo 
+      ? `${systemPrompt}\n\n${contextInfo}`
+      : systemPrompt;
 
-CRITICAL: When tools return formatted output with sections, headers, bullet points, or structured data, you MUST display it exactly as provided. Never summarize or rewrite formatted tool outputs - show them verbatim.` : systemPrompt;
-
-    // Token optimization logging
-    console.log(`📊 Token optimization applied:
-- Query type: ${queryType}
-- System prompt: ${systemPrompt.length} chars (vs ${this.SYSTEM_PROMPT.length} full)
-- Tools included: ${relevantTools.length}/${this.tools.length}
-- Context info: ${contextInfo.length} chars
-- Max tokens: ${maxTokens}`);
-
+    // Prepare messages
     const messages: Anthropic.MessageParam[] = [
       {
         role: "user",
         content: query,
       },
     ];
+
+    console.log(`📊 Token optimization applied:
+- Query type: ${queryType}
+- System prompt: ${contextualSystemPrompt.length} chars (vs ${this.SYSTEM_PROMPT.length} full)
+- Tools included: ${relevantTools.length}/${this.tools.length}
+- Context info: ${contextInfo.length} chars
+- Max tokens: ${maxTokens}`);
 
     try {
       onChunk({
@@ -472,15 +491,34 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
         toolsAvailable: relevantTools.length
       });
 
-      // Use streaming for the initial response
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: maxTokens,
-        system: contextualSystemPrompt,
-        messages,
-        tools: relevantTools,
-        stream: true,
-      } as any);
+      // Retry logic for API overload errors
+      let response;
+      let retryCount = 0;
+      const maxRetries = 3;
+      
+      while (retryCount < maxRetries) {
+        try {
+          // Use streaming for the initial response
+          response = await this.anthropic.messages.create({
+            model: "claude-3-5-sonnet-20241022",
+            max_tokens: maxTokens,
+            system: contextualSystemPrompt,
+            messages,
+            tools: relevantTools,
+            stream: true,
+          } as any);
+          break; // Success, exit retry loop
+        } catch (error: any) {
+          if (error.status === 529 && retryCount < maxRetries - 1) {
+            retryCount++;
+            const waitTime = Math.pow(2, retryCount) * 1000; // Exponential backoff
+            console.log(`🔄 API overload (529), retrying in ${waitTime}ms (attempt ${retryCount}/${maxRetries})`);
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+            continue;
+          }
+          throw error; // Re-throw if not a 529 error or max retries reached
+        }
+      }
 
       let streamedContent = '';
       let toolCalls: any[] = [];
@@ -673,7 +711,7 @@ private async processToolCallsWithStreaming(
     // Check cache first
     let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
     
-    if (!result) {
+    if (!result || toolName === 'date-utility') { // Skip cache for date-utility
       // Enhance tool arguments with context
       const enhancedArgs = await this.contextManager.enhanceToolArguments(
         sessionId,
@@ -694,8 +732,11 @@ private async processToolCallsWithStreaming(
         console.log("Tool result:", JSON.stringify(result, null, 2));
         
         // Cache the result
-        const cacheTime = toolName.includes('search') ? 300 : 3600;
-        await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+        const cacheTime = toolName.includes('search') ? 300 : 
+                         toolName === 'date-utility' ? 0 : 3600; // Don't cache date-utility
+        if (cacheTime > 0) {
+          await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+        }
         
         // Record tool usage in context
         await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
@@ -1198,7 +1239,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           // Check cache first using the optimized caching system
           let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
           
-          if (!result) {
+          if (!result || toolName === 'date-utility') { // Skip cache for date-utility
             // Enhance tool arguments with context using the new optimized method
             const enhancedArgs = await this.contextManager.enhanceToolArguments(
               sessionId,
@@ -1219,8 +1260,11 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
               console.log("Tool result:", JSON.stringify(result, null, 2));
               
               // Cache the result using optimized caching (search results cache for 5 min, data for 1 hour)
-              const cacheTime = toolName.includes('search') ? 300 : 3600;
-              await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+              const cacheTime = toolName.includes('search') ? 300 : 
+                               toolName === 'date-utility' ? 0 : 3600; // Don't cache date-utility
+              if (cacheTime > 0) {
+                await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
+              }
               
               // Record tool usage in context with automatic compression and summarization
               await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
