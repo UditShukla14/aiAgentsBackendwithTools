@@ -91,6 +91,293 @@ export function registerUtilityTools(server: McpServer) {
       };
     }
   );
+
+  server.tool(
+    "date-utility",
+    "Perform date calculations, validation, and formatting operations",
+    {
+      operation: z.enum(['validate', 'format', 'add', 'subtract', 'difference', 'parse']).describe("Type of date operation to perform"),
+      date: z.string().optional().describe("Date to work with (YYYY-MM-DD format or natural language)"),
+      format: z.string().optional().describe("Output format for date formatting (e.g., 'MM/DD/YYYY', 'DD-MM-YYYY', 'ISO')"),
+      amount: z.number().optional().describe("Number of units to add/subtract"),
+      unit: z.enum(['days', 'weeks', 'months', 'years']).optional().describe("Time unit for add/subtract operations"),
+      date2: z.string().optional().describe("Second date for difference calculation"),
+    },
+    async ({ operation, date, format, amount, unit, date2 }) => {
+      try {
+        const today = new Date();
+        
+        // Helper function to parse date
+        const parseDate = (dateStr: string): Date | null => {
+          // Try ISO format first
+          const isoDate = new Date(dateStr);
+          if (!isNaN(isoDate.getTime())) return isoDate;
+          
+          // Try natural language
+          const lowerDate = dateStr.toLowerCase();
+          if (lowerDate === 'today') return today;
+          if (lowerDate === 'yesterday') {
+            const yesterday = new Date(today);
+            yesterday.setDate(today.getDate() - 1);
+            return yesterday;
+          }
+          if (lowerDate === 'tomorrow') {
+            const tomorrow = new Date(today);
+            tomorrow.setDate(today.getDate() + 1);
+            return tomorrow;
+          }
+          
+          return null;
+        };
+        
+        // Helper function to format date
+        const formatDate = (date: Date, formatStr?: string): string => {
+          if (!formatStr || formatStr === 'ISO') {
+            return date.toISOString().split('T')[0];
+          }
+          
+          const year = date.getFullYear();
+          const month = String(date.getMonth() + 1).padStart(2, '0');
+          const day = String(date.getDate()).padStart(2, '0');
+          
+          return formatStr
+            .replace('YYYY', String(year))
+            .replace('MM', month)
+            .replace('DD', day);
+        };
+
+        switch (operation) {
+          case 'validate':
+            if (!date) {
+              return { content: [{ type: "text", text: "Error: Date parameter required for validation" }] };
+            }
+            const parsedDate = parseDate(date);
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  date: date,
+                  is_valid: parsedDate !== null,
+                  parsed_date: parsedDate ? formatDate(parsedDate) : null,
+                  error: parsedDate === null ? "Could not parse date" : null
+                }, null, 2)
+              }]
+            };
+
+          case 'format':
+            if (!date) {
+              return { content: [{ type: "text", text: "Error: Date parameter required for formatting" }] };
+            }
+            const dateToFormat = parseDate(date);
+            if (!dateToFormat) {
+              return { content: [{ type: "text", text: "Error: Invalid date provided" }] };
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  original_date: date,
+                  formatted_date: formatDate(dateToFormat, format),
+                  available_formats: {
+                    ISO: formatDate(dateToFormat, 'ISO'),
+                    "MM/DD/YYYY": formatDate(dateToFormat, 'MM/DD/YYYY'),
+                    "DD-MM-YYYY": formatDate(dateToFormat, 'DD-MM-YYYY'),
+                    "YYYY/MM/DD": formatDate(dateToFormat, 'YYYY/MM/DD')
+                  }
+                }, null, 2)
+              }]
+            };
+
+          case 'add':
+            if (!date || !amount || !unit) {
+              return { content: [{ type: "text", text: "Error: Date, amount, and unit parameters required for add operation" }] };
+            }
+            const baseDate = parseDate(date);
+            if (!baseDate) {
+              return { content: [{ type: "text", text: "Error: Invalid base date provided" }] };
+            }
+            const addedDate = new Date(baseDate);
+            switch (unit) {
+              case 'days':
+                addedDate.setDate(baseDate.getDate() + amount);
+                break;
+              case 'weeks':
+                addedDate.setDate(baseDate.getDate() + (amount * 7));
+                break;
+              case 'months':
+                addedDate.setMonth(baseDate.getMonth() + amount);
+                break;
+              case 'years':
+                addedDate.setFullYear(baseDate.getFullYear() + amount);
+                break;
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  base_date: formatDate(baseDate),
+                  operation: `add ${amount} ${unit}`,
+                  result_date: formatDate(addedDate),
+                  human_readable: addedDate.toLocaleDateString()
+                }, null, 2)
+              }]
+            };
+
+          case 'subtract':
+            if (!date || !amount || !unit) {
+              return { content: [{ type: "text", text: "Error: Date, amount, and unit parameters required for subtract operation" }] };
+            }
+            const baseDateSub = parseDate(date);
+            if (!baseDateSub) {
+              return { content: [{ type: "text", text: "Error: Invalid base date provided" }] };
+            }
+            const subtractedDate = new Date(baseDateSub);
+            switch (unit) {
+              case 'days':
+                subtractedDate.setDate(baseDateSub.getDate() - amount);
+                break;
+              case 'weeks':
+                subtractedDate.setDate(baseDateSub.getDate() - (amount * 7));
+                break;
+              case 'months':
+                subtractedDate.setMonth(baseDateSub.getMonth() - amount);
+                break;
+              case 'years':
+                subtractedDate.setFullYear(baseDateSub.getFullYear() - amount);
+                break;
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  base_date: formatDate(baseDateSub),
+                  operation: `subtract ${amount} ${unit}`,
+                  result_date: formatDate(subtractedDate),
+                  human_readable: subtractedDate.toLocaleDateString()
+                }, null, 2)
+              }]
+            };
+
+          case 'difference':
+            if (!date || !date2) {
+              return { content: [{ type: "text", text: "Error: Two dates required for difference calculation" }] };
+            }
+            const date1 = parseDate(date);
+            const date2Parsed = parseDate(date2);
+            if (!date1 || !date2Parsed) {
+              return { content: [{ type: "text", text: "Error: Invalid date(s) provided" }] };
+            }
+            const diffTime = Math.abs(date2Parsed.getTime() - date1.getTime());
+            const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+            const diffWeeks = Math.floor(diffDays / 7);
+            const diffMonths = Math.floor(diffDays / 30.44);
+            const diffYears = Math.floor(diffDays / 365.25);
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  date1: formatDate(date1),
+                  date2: formatDate(date2Parsed),
+                  difference: {
+                    days: diffDays,
+                    weeks: diffWeeks,
+                    months: diffMonths,
+                    years: diffYears
+                  },
+                  is_future: date2Parsed > date1,
+                  is_past: date2Parsed < date1,
+                  is_same: date1.getTime() === date2Parsed.getTime()
+                }, null, 2)
+              }]
+            };
+
+          case 'parse':
+            if (!date) {
+              return { content: [{ type: "text", text: "Error: Date parameter required for parsing" }] };
+            }
+            const parsedDateResult = parseDate(date);
+            if (!parsedDateResult) {
+              return { content: [{ type: "text", text: "Error: Could not parse date" }] };
+            }
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  input: date,
+                  parsed_date: formatDate(parsedDateResult),
+                  components: {
+                    year: parsedDateResult.getFullYear(),
+                    month: parsedDateResult.getMonth() + 1,
+                    day: parsedDateResult.getDate(),
+                    day_of_week: parsedDateResult.getDay(),
+                    day_name: parsedDateResult.toLocaleDateString('en-US', { weekday: 'long' }),
+                    month_name: parsedDateResult.toLocaleDateString('en-US', { month: 'long' })
+                  },
+                  human_readable: parsedDateResult.toLocaleDateString(),
+                  iso_string: parsedDateResult.toISOString()
+                }, null, 2)
+              }]
+            };
+
+          default:
+            return { content: [{ type: "text", text: "Error: Unknown operation" }] };
+        }
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      }
+    }
+  );
+
+  server.tool(
+    "calculateDateRangeFromExpression",
+    "Convert natural language date expressions to actual date ranges using Claude's understanding",
+    {
+      expression: z.string().describe("Natural language date expression (e.g., 'last week', 'this quarter', 'past 30 days')"),
+      reference_date: z.string().optional().describe("Reference date (YYYY-MM-DD format, defaults to today)"),
+    },
+    async ({ expression, reference_date }) => {
+      try {
+        const today = new Date();
+        const refDate = reference_date ? new Date(reference_date) : today;
+        
+        if (isNaN(refDate.getTime())) {
+          return { content: [{ type: "text", text: "Error: Invalid reference date format" }] };
+        }
+        
+        // Helper function to format date as YYYY-MM-DD
+        const formatDate = (date: Date): string => {
+          return date.toISOString().split('T')[0];
+        };
+
+        // Let Claude handle all date expression interpretation
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              instruction: "Please interpret this natural language date expression and calculate the actual date range.",
+              expression: expression,
+              reference_date: formatDate(refDate),
+              current_date: formatDate(today),
+              examples: {
+                "last week": "from_date: 7 days ago from reference, to_date: end of that week",
+                "this month": "from_date: first day of current month, to_date: last day of current month",
+                "past 30 days": "from_date: 30 days ago from reference, to_date: reference date",
+                "next week": "from_date: next Monday, to_date: next Sunday",
+                "this quarter": "from_date: first day of current quarter, to_date: last day of current quarter",
+                "yesterday": "from_date: yesterday, to_date: yesterday",
+                "tomorrow": "from_date: tomorrow, to_date: tomorrow",
+                "today": "from_date: today, to_date: today"
+              },
+              request: "Please calculate the actual from_date and to_date in YYYY-MM-DD format for the expression: " + expression
+            }, null, 2)
+          }]
+        };
+
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      }
+    }
+  );
 }
 
 export function registerBusinessTools(server: McpServer) {
@@ -179,9 +466,69 @@ server.tool(
   },
   async ({ from_date, to_date, search, take = 25, skip }) => {
     try {
+      // Enhanced date cleaning and validation
+      const cleanDate = (date: string | undefined): string | undefined => {
+        if (!date) return undefined;
+        return date.trim();
+      };
+
+      let cleanFromDate = cleanDate(from_date);
+      let cleanToDate = cleanDate(to_date);
+
+      // Enhanced date validation function
+      const validateDate = (dateStr: string): { isValid: boolean; error?: string; parsedDate?: Date } => {
+        // Check ISO format first
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+          const date = new Date(dateStr);
+          if (!isNaN(date.getTime())) {
+            return { isValid: true, parsedDate: date };
+          }
+        }
+        
+        // Check other common formats
+        const formats = [
+          /^\d{1,2}\/\d{1,2}\/\d{4}$/, // MM/DD/YYYY or M/D/YYYY
+          /^\d{1,2}-\d{1,2}-\d{4}$/, // MM-DD-YYYY or M-D-YYYY
+          /^\d{4}\/\d{1,2}\/\d{1,2}$/, // YYYY/MM/DD or YYYY/M/D
+        ];
+        
+        for (const format of formats) {
+          if (format.test(dateStr)) {
+            const date = new Date(dateStr);
+            if (!isNaN(date.getTime())) {
+              return { isValid: true, parsedDate: date };
+            }
+          }
+        }
+        
+        return { 
+          isValid: false, 
+          error: `Invalid date format: ${dateStr}. Please use YYYY-MM-DD, MM/DD/YYYY, or MM-DD-YYYY format.` 
+        };
+      };
+
+      // Validate and convert dates
+      if (cleanFromDate) {
+        const fromValidation = validateDate(cleanFromDate);
+        if (!fromValidation.isValid) {
+          return { content: [{ type: "text", text: fromValidation.error! }] };
+        }
+        // Convert to ISO format for API
+        cleanFromDate = fromValidation.parsedDate!.toISOString().split('T')[0];
+      }
+      
+      if (cleanToDate) {
+        const toValidation = validateDate(cleanToDate);
+        if (!toValidation.isValid) {
+          return { content: [{ type: "text", text: toValidation.error! }] };
+        }
+        // Convert to ISO format for API
+        cleanToDate = toValidation.parsedDate!.toISOString().split('T')[0];
+      }
+
       const data = await callIMPApi("/api/estimate/list", {
-        ...(from_date && { from_date }),
-        ...(to_date && { to_date }),
+        ...(cleanFromDate && { from_date: cleanFromDate }),
+        ...(cleanToDate && { to_date: cleanToDate }),
         ...(search && { search }),
         take,
         ...(skip && { skip })
@@ -210,29 +557,67 @@ server.tool(
   "calculateDateRange",
   "Calculate date range from natural language expressions or specific dates",
   {
-    date_expression: z.string().describe("Natural language date expression (e.g., 'last week', 'past 30 days', '2024-03-01 to 2025-02-28')"),
+    date_expression: z.string().describe("Natural language date expression (e.g., 'last week', 'past 30 days', '2024-03-01 to 2025-02-28', 'this month', 'next week')"),
   },
   async ({ date_expression }) => {
     try {
-      // First try to parse as a date range (YYYY-MM-DD to YYYY-MM-DD)
-      const dateRangeMatch = date_expression.match(/^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/i);
-      if (dateRangeMatch) {
+      const today = new Date();
+      
+      // Helper function to format date as YYYY-MM-DD
+      const formatDate = (date: Date): string => {
+        return date.toISOString().split('T')[0];
+      };
+
+      // Simple validation for exact date formats only
+      const exactDateMatch = date_expression.match(/^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/i);
+      if (exactDateMatch) {
+        const fromDate = new Date(exactDateMatch[1]);
+        const toDate = new Date(exactDateMatch[2]);
+        
+        if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "Invalid date format in range",
+                expression: date_expression,
+                supported_formats: ["YYYY-MM-DD to YYYY-MM-DD"]
+              }, null, 2)
+            }]
+          };
+        }
+        
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              from_date: dateRangeMatch[1],
-              to_date: dateRangeMatch[2],
+              from_date: exactDateMatch[1],
+              to_date: exactDateMatch[2],
               expression: date_expression,
-              type: "exact_dates"
+              type: "exact_dates",
+              days_difference: Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24))
             }, null, 2)
           }]
         };
       }
 
-      // If not a date range, try to parse as a single date
+      // Single date validation
       const singleDateMatch = date_expression.match(/^\d{4}-\d{2}-\d{2}$/);
       if (singleDateMatch) {
+        const date = new Date(date_expression);
+        if (isNaN(date.getTime())) {
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                error: "Invalid date format",
+                expression: date_expression,
+                supported_formats: ["YYYY-MM-DD"]
+              }, null, 2)
+            }]
+          };
+        }
+        
         return {
           content: [{
             type: "text",
@@ -246,16 +631,25 @@ server.tool(
         };
       }
 
+      // For all natural language expressions, let Claude handle the interpretation
       return {
         content: [{
           type: "text",
           text: JSON.stringify({
-            error: "Could not parse date expression",
+            instruction: "Please interpret this natural language date expression and return the corresponding date range in YYYY-MM-DD format.",
             expression: date_expression,
-            supported_formats: [
-              "YYYY-MM-DD to YYYY-MM-DD",
-              "YYYY-MM-DD"
-            ]
+            current_date: formatDate(today),
+            examples: {
+              "last week": "from_date: 7 days ago, to_date: today",
+              "this month": "from_date: first day of current month, to_date: last day of current month",
+              "past 30 days": "from_date: 30 days ago, to_date: today",
+              "next week": "from_date: next Monday, to_date: next Sunday",
+              "this quarter": "from_date: first day of current quarter, to_date: last day of current quarter",
+              "yesterday": "from_date: yesterday, to_date: yesterday",
+              "tomorrow": "from_date: tomorrow, to_date: tomorrow",
+              "today": "from_date: today, to_date: today"
+            },
+            request: "Please calculate the actual from_date and to_date in YYYY-MM-DD format for the expression: " + date_expression
           }, null, 2)
         }]
       };
@@ -280,21 +674,64 @@ server.tool(
   },
   async ({ from_date, to_date, search, take = 25, skip, get_all = false }) => {
     try {
-      // Clean dates by removing any newlines or extra spaces
+      // Enhanced date cleaning and validation
       const cleanDate = (date: string | undefined): string | undefined => {
         if (!date) return undefined;
         return date.trim();
       };
 
-      const cleanFromDate = cleanDate(from_date);
-      const cleanToDate = cleanDate(to_date);
+      let cleanFromDate = cleanDate(from_date);
+      let cleanToDate = cleanDate(to_date);
 
-      // Validate date format if dates are provided
-      if (cleanFromDate && !/^\d{4}-\d{2}-\d{2}$/.test(cleanFromDate)) {
-        return { content: [{ type: "text", text: `Invalid from_date format. Please use YYYY-MM-DD format.` }] };
+      // Enhanced date validation function
+      const validateDate = (dateStr: string): { isValid: boolean; error?: string; parsedDate?: Date } => {
+        // Check ISO format first
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+          const date = new Date(dateStr);
+          if (!isNaN(date.getTime())) {
+            return { isValid: true, parsedDate: date };
+          }
+        }
+        
+        // Check other common formats
+        const formats = [
+          /^\d{1,2}\/\d{1,2}\/\d{4}$/, // MM/DD/YYYY or M/D/YYYY
+          /^\d{1,2}-\d{1,2}-\d{4}$/, // MM-DD-YYYY or M-D-YYYY
+          /^\d{4}\/\d{1,2}\/\d{1,2}$/, // YYYY/MM/DD or YYYY/M/D
+        ];
+        
+        for (const format of formats) {
+          if (format.test(dateStr)) {
+            const date = new Date(dateStr);
+            if (!isNaN(date.getTime())) {
+              return { isValid: true, parsedDate: date };
+            }
+          }
+        }
+        
+        return { 
+          isValid: false, 
+          error: `Invalid date format: ${dateStr}. Please use YYYY-MM-DD, MM/DD/YYYY, or MM-DD-YYYY format.` 
+        };
+      };
+
+      // Validate and convert dates
+      if (cleanFromDate) {
+        const fromValidation = validateDate(cleanFromDate);
+        if (!fromValidation.isValid) {
+          return { content: [{ type: "text", text: fromValidation.error! }] };
+        }
+        // Convert to ISO format for API
+        cleanFromDate = fromValidation.parsedDate!.toISOString().split('T')[0];
       }
-      if (cleanToDate && !/^\d{4}-\d{2}-\d{2}$/.test(cleanToDate)) {
-        return { content: [{ type: "text", text: `Invalid to_date format. Please use YYYY-MM-DD format.` }] };
+      
+      if (cleanToDate) {
+        const toValidation = validateDate(cleanToDate);
+        if (!toValidation.isValid) {
+          return { content: [{ type: "text", text: toValidation.error! }] };
+        }
+        // Convert to ISO format for API
+        cleanToDate = toValidation.parsedDate!.toISOString().split('T')[0];
       }
 
       // First get total records if get_all is true
@@ -801,11 +1238,71 @@ server.tool(
     filter 
   }) => {
     try {
+      // Enhanced date cleaning and validation
+      const cleanDate = (date: string | undefined): string | undefined => {
+        if (!date) return undefined;
+        return date.trim();
+      };
+
+      let cleanFromDate = cleanDate(from_date);
+      let cleanToDate = cleanDate(to_date);
+
+      // Enhanced date validation function
+      const validateDate = (dateStr: string): { isValid: boolean; error?: string; parsedDate?: Date } => {
+        // Check ISO format first
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+          const date = new Date(dateStr);
+          if (!isNaN(date.getTime())) {
+            return { isValid: true, parsedDate: date };
+          }
+        }
+        
+        // Check other common formats
+        const formats = [
+          /^\d{1,2}\/\d{1,2}\/\d{4}$/, // MM/DD/YYYY or M/D/YYYY
+          /^\d{1,2}-\d{1,2}-\d{4}$/, // MM-DD-YYYY or M-D-YYYY
+          /^\d{4}\/\d{1,2}\/\d{1,2}$/, // YYYY/MM/DD or YYYY/M/D
+        ];
+        
+        for (const format of formats) {
+          if (format.test(dateStr)) {
+            const date = new Date(dateStr);
+            if (!isNaN(date.getTime())) {
+              return { isValid: true, parsedDate: date };
+            }
+          }
+        }
+        
+        return { 
+          isValid: false, 
+          error: `Invalid date format: ${dateStr}. Please use YYYY-MM-DD, MM/DD/YYYY, or MM-DD-YYYY format.` 
+        };
+      };
+
+      // Validate and convert dates
+      if (cleanFromDate) {
+        const fromValidation = validateDate(cleanFromDate);
+        if (!fromValidation.isValid) {
+          return { content: [{ type: "text", text: fromValidation.error! }] };
+        }
+        // Convert to ISO format for API
+        cleanFromDate = fromValidation.parsedDate!.toISOString().split('T')[0];
+      }
+      
+      if (cleanToDate) {
+        const toValidation = validateDate(cleanToDate);
+        if (!toValidation.isValid) {
+          return { content: [{ type: "text", text: toValidation.error! }] };
+        }
+        // Convert to ISO format for API
+        cleanToDate = toValidation.parsedDate!.toISOString().split('T')[0];
+      }
+
       const data = await callIMPApi("/api/inventory/stock_list", {
         warehouse_id,
         ...(search && { search }),
-        ...(from_date && { from_date }),
-        ...(to_date && { to_date }),
+        ...(cleanFromDate && { from_date: cleanFromDate }),
+        ...(cleanToDate && { to_date: cleanToDate }),
         ...(page && { page }),
         ...(take && { take }),
         ...(only_available !== undefined && { only_available }),

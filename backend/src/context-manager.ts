@@ -478,24 +478,25 @@ export class ContextManager {
     const query = queries.join(' ').toLowerCase();
     const today = new Date();
     
+    // Helper function to format date as YYYY-MM-DD
+    const formatDate = (date: Date): string => {
+      return date.toISOString().split('T')[0];
+    };
+    
+    // Only handle very basic patterns, let Claude handle the rest
     if (query.includes('today')) {
-      dateRange.from = dateRange.to = today.toISOString().split('T')[0];
+      dateRange.from = dateRange.to = formatDate(today);
     } else if (query.includes('yesterday')) {
       const yesterday = new Date(today);
-      yesterday.setDate(yesterday.getDate() - 1);
-      dateRange.from = dateRange.to = yesterday.toISOString().split('T')[0];
-    } else if (query.includes('this week')) {
-      const weekStart = new Date(today);
-      weekStart.setDate(today.getDate() - today.getDay());
-      dateRange.from = weekStart.toISOString().split('T')[0];
-    } else if (query.includes('last week')) {
-      const lastWeekEnd = new Date(today);
-      lastWeekEnd.setDate(today.getDate() - today.getDay() - 1);
-      const lastWeekStart = new Date(lastWeekEnd);
-      lastWeekStart.setDate(lastWeekEnd.getDate() - 6);
-      dateRange.from = lastWeekStart.toISOString().split('T')[0];
-      dateRange.to = lastWeekEnd.toISOString().split('T')[0];
+      yesterday.setDate(today.getDate() - 1);
+      dateRange.from = dateRange.to = formatDate(yesterday);
+    } else if (query.includes('tomorrow')) {
+      const tomorrow = new Date(today);
+      tomorrow.setDate(today.getDate() + 1);
+      dateRange.from = dateRange.to = formatDate(tomorrow);
     }
+    // For all other expressions, let Claude handle them in the tool calls
+    // This keeps the context manager simple and leverages Claude's understanding
     
     return dateRange;
   }
