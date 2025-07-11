@@ -398,10 +398,11 @@ export class ContextManager {
           console.log(`🧠 Auto-filled search: ${context.activeEntities.customerName}`);
         }
         
-        // Handle date ranges
-        const dateRange = this.inferDateRange([currentQuery]);
-        if (dateRange.from) enhancedArgs.from_date = dateRange.from;
-        if (dateRange.to) enhancedArgs.to_date = dateRange.to;
+        // Let the AI handle date calculations with proper tools instead of auto-inference
+        // This ensures accurate date calculations and proper tool usage
+        // const dateRange = this.inferDateRange([currentQuery]);
+        // if (dateRange.from) enhancedArgs.from_date = dateRange.from;
+        // if (dateRange.to) enhancedArgs.to_date = dateRange.to;
         break;
 
       case 'getProductDetails':

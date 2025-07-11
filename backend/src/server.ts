@@ -92,6 +92,15 @@ For business data queries (products, customers, invoices, estimates):
 - Explain what data you're retrieving and why
 - Format the results clearly and professionally
 
+CRITICAL DATE HANDLING:
+- When users mention dates or time periods (yesterday, last week, this month, etc.), ALWAYS use the date calculation tools first
+- Use calculateDateRange or calculateDateRangeFromExpression to convert natural language to exact dates
+- Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
+- NEVER guess or assume dates - always calculate them properly
+- NEVER use searchEstimateList or searchInvoiceList directly with date expressions
+- ALWAYS follow this pattern: "yesterday" → calculateDateRange("yesterday") → use result with searchEstimateList
+- If you see "yesterday", "today", "last week", etc., you MUST call a date calculation tool first
+
 Be conversational and natural in your responses:
 - For greetings (hello, hi, good morning), respond warmly and briefly
 - For thanks/appreciation, simply say "You're welcome!" or similar
@@ -182,6 +191,15 @@ IMPORTANT CONTEXT HANDLING:
       case 'business':
         return `You are a business assistant with access to InvoiceMakerPro tools for managing customers, products, invoices, and estimates. Use the appropriate tools to help with business data queries.
 
+CRITICAL DATE HANDLING:
+- When users mention dates or time periods (yesterday, last week, this month, etc.), ALWAYS use the date calculation tools first
+- Use calculateDateRange or calculateDateRangeFromExpression to convert natural language to exact dates
+- Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
+- NEVER guess or assume dates - always calculate them properly
+- NEVER use searchEstimateList or searchInvoiceList directly with date expressions
+- ALWAYS follow this pattern: "yesterday" → calculateDateRange("yesterday") → use result with searchEstimateList
+- If you see "yesterday", "today", "last week", etc., you MUST call a date calculation tool first
+
 IMPORTANT: 
 - Display tool results exactly as provided
 - Use conversation context to resolve pronouns and references automatically
@@ -214,6 +232,15 @@ IMPORTANT:
       const relevantTools = this.tools.filter(tool => {
         const toolName = tool.name.toLowerCase();
         
+        // Date-related queries - ALWAYS include date calculation tools
+        if (lowerQuery.includes('yesterday') || lowerQuery.includes('today') || 
+            lowerQuery.includes('tomorrow') || lowerQuery.includes('last week') ||
+            lowerQuery.includes('this month') || lowerQuery.includes('last month') ||
+            lowerQuery.includes('date') || lowerQuery.includes('time') ||
+            lowerQuery.includes('period') || lowerQuery.includes('range')) {
+          if (toolName.includes('date') || toolName.includes('calculate')) return true;
+        }
+        
         // Customer-related queries
         if ((lowerQuery.includes('customer') || lowerQuery.includes('client')) && 
             toolName.includes('customer')) return true;
@@ -237,10 +264,18 @@ IMPORTANT:
         return false;
       });
       
-      // If no specific matches, include basic search tools
-      return relevantTools.length > 0 ? relevantTools : 
-             this.tools.filter(tool => tool.name.toLowerCase().includes('search') || 
-                                     tool.name.toLowerCase().includes('list'));
+      // If no specific matches, include basic search tools and date tools
+      if (relevantTools.length === 0) {
+        return this.tools.filter(tool => {
+          const toolName = tool.name.toLowerCase();
+          return toolName.includes('search') || 
+                 toolName.includes('list') ||
+                 toolName.includes('date') ||
+                 toolName.includes('calculate');
+        });
+      }
+      
+      return relevantTools;
     }
     
     return this.tools; // All tools for complex queries
