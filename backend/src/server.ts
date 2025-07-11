@@ -93,13 +93,14 @@ For business data queries (products, customers, invoices, estimates):
 - Format the results clearly and professionally
 
 CRITICAL DATE HANDLING:
-- When users mention dates or time periods (yesterday, last week, this month, etc.), ALWAYS use the date calculation tool first
-- Use calculateDateRangeFromExpression to convert natural language to exact dates
+- For ANY query that mentions dates, time periods, or time-related words, ALWAYS use the date calculation tool first
+- Use calculateDateRangeFromExpression to convert ANY natural language date expression to exact dates
 - Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
 - NEVER guess or assume dates - always calculate them properly
 - NEVER use searchEstimateList or searchInvoiceList directly with date expressions
-- ALWAYS follow this pattern: "yesterday" → calculateDateRangeFromExpression("yesterday") → use result with searchEstimateList
-- If you see "yesterday", "today", "last week", etc., you MUST call calculateDateRangeFromExpression first
+- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → calculateDateRangeFromExpression(EXPRESSION) → use result with searchEstimateList
+- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", etc.
+- If you see ANY date-related words, you MUST call calculateDateRangeFromExpression first
 
 Be conversational and natural in your responses:
 - For greetings (hello, hi, good morning), respond warmly and briefly
@@ -120,7 +121,12 @@ IMPORTANT CONTEXT HANDLING:
 - If a tool requires parameters that aren't explicitly provided but are available from recent context, use them automatically
 - For example: if discussing John Doe and user asks "get his address", automatically use John Doe's customer ID
 - Always check recent tool results for relevant entity IDs (customer_id, product_id, etc.) before asking users to provide them
-- Only ask for missing information if it's truly not available in the conversation context`;
+- Only ask for missing information if it's truly not available in the conversation context
+
+CUSTOMER SEARCH GUIDELINES:
+- For specific customer name searches (e.g., "customer by name gory"), use findCustomerByName tool for more precise results
+- For general customer searches, use searchCustomerList tool
+- Always prefer exact name matches over partial matches when possible`;
 
   constructor() {
     this.anthropic = new Anthropic({
@@ -192,18 +198,24 @@ IMPORTANT CONTEXT HANDLING:
         return `You are a business assistant with access to InvoiceMakerPro tools for managing customers, products, invoices, and estimates. Use the appropriate tools to help with business data queries.
 
 CRITICAL DATE HANDLING:
-- When users mention dates or time periods (yesterday, last week, this month, etc.), ALWAYS use the date calculation tool first
-- Use calculateDateRangeFromExpression to convert natural language to exact dates
+- For ANY query that mentions dates, time periods, or time-related words, ALWAYS use the date calculation tool first
+- Use calculateDateRangeFromExpression to convert ANY natural language date expression to exact dates
 - Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
 - NEVER guess or assume dates - always calculate them properly
 - NEVER use searchEstimateList or searchInvoiceList directly with date expressions
-- ALWAYS follow this pattern: "yesterday" → calculateDateRangeFromExpression("yesterday") → use result with searchEstimateList
-- If you see "yesterday", "today", "last week", etc., you MUST call calculateDateRangeFromExpression first
+- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → calculateDateRangeFromExpression(EXPRESSION) → use result with searchEstimateList
+- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", etc.
+- If you see ANY date-related words, you MUST call calculateDateRangeFromExpression first
 
 IMPORTANT: 
 - Display tool results exactly as provided
 - Use conversation context to resolve pronouns and references automatically
-- Only ask for missing information if it's not available in context`;
+- Only ask for missing information if it's not available in context
+
+CUSTOMER SEARCH GUIDELINES:
+- For specific customer name searches (e.g., "customer by name gory"), use findCustomerByName tool for more precise results
+- For general customer searches, use searchCustomerList tool
+- Always prefer exact name matches over partial matches when possible`;
         
       case 'complex':
         return this.SYSTEM_PROMPT; // Full prompt for complex tasks
@@ -232,18 +244,31 @@ IMPORTANT:
       const relevantTools = this.tools.filter(tool => {
         const toolName = tool.name.toLowerCase();
         
-        // Date-related queries - ALWAYS include date calculation tool
-        if (lowerQuery.includes('yesterday') || lowerQuery.includes('today') || 
-            lowerQuery.includes('tomorrow') || lowerQuery.includes('last week') ||
-            lowerQuery.includes('this month') || lowerQuery.includes('last month') ||
-            lowerQuery.includes('date') || lowerQuery.includes('time') ||
-            lowerQuery.includes('period') || lowerQuery.includes('range')) {
+        // Date-related queries - ALWAYS include date calculation tool for ANY date expression
+        const dateKeywords = [
+          'yesterday', 'today', 'tomorrow', 'last', 'this', 'next', 'past', 'ago',
+          'date', 'time', 'period', 'range', 'week', 'month', 'year', 'days',
+          'quarter', 'decade', 'century', 'morning', 'afternoon', 'evening',
+          'night', 'dawn', 'dusk', 'noon', 'midnight', 'hour', 'minute', 'second',
+          'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
+          'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+          'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr',
+          'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+        ];
+        
+        if (dateKeywords.some(keyword => lowerQuery.includes(keyword))) {
           if (toolName.includes('calculateDateRangeFromExpression')) return true;
         }
         
         // Customer-related queries
         if ((lowerQuery.includes('customer') || lowerQuery.includes('client')) && 
             toolName.includes('customer')) return true;
+            
+        // Specific customer name searches
+        if (lowerQuery.includes('by name') || lowerQuery.includes('named') || 
+            (lowerQuery.includes('customer') && lowerQuery.includes('name'))) {
+          if (toolName.includes('findCustomerByName')) return true;
+        }
             
         // Product-related queries  
         if (lowerQuery.includes('product') && toolName.includes('product')) return true;

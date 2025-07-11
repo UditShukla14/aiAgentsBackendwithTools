@@ -422,21 +422,25 @@ export function registerUtilityTools(server: McpServer) {
               reference_date: formatDate(refDate),
               current_date: formatDate(today),
               examples: {
-                "last week": { "from_date": "2024-01-15", "to_date": "2024-01-21" },
-                "this month": { "from_date": "2024-01-01", "to_date": "2024-01-31" },
-                "past 30 days": { "from_date": "2023-12-23", "to_date": "2024-01-22" },
-                "next week": { "from_date": "2024-01-29", "to_date": "2024-02-04" },
-                "this quarter": { "from_date": "2024-01-01", "to_date": "2024-03-31" },
-                "yesterday": { "from_date": "2024-01-21", "to_date": "2024-01-21" },
-                "tomorrow": { "from_date": "2024-01-23", "to_date": "2024-01-23" },
-                "today": { "from_date": "2024-01-22", "to_date": "2024-01-22" },
-                "last 1 week": { "from_date": "2024-01-15", "to_date": "2024-01-22" },
-                "last month": { "from_date": "2023-12-01", "to_date": "2023-12-31" },
-                "next month": { "from_date": "2024-02-01", "to_date": "2024-02-29" },
-                "this year": { "from_date": "2024-01-01", "to_date": "2024-12-31" },
-                "last year": { "from_date": "2023-01-01", "to_date": "2023-12-31" }
+                "last week": { "from_date": "2025-01-13", "to_date": "2025-01-19" },
+                "last 2 weeks": { "from_date": "2025-01-06", "to_date": "2025-01-19" },
+                "this month": { "from_date": "2025-01-01", "to_date": "2025-01-31" },
+                "past 30 days": { "from_date": "2024-12-23", "to_date": "2025-01-22" },
+                "next week": { "from_date": "2025-01-27", "to_date": "2025-02-02" },
+                "this quarter": { "from_date": "2025-01-01", "to_date": "2025-03-31" },
+                "yesterday": { "from_date": "2025-01-21", "to_date": "2025-01-21" },
+                "tomorrow": { "from_date": "2025-01-23", "to_date": "2025-01-23" },
+                "today": { "from_date": "2025-01-22", "to_date": "2025-01-22" },
+                "last month": { "from_date": "2024-12-01", "to_date": "2024-12-31" },
+                "next month": { "from_date": "2025-02-01", "to_date": "2025-02-28" },
+                "this year": { "from_date": "2025-01-01", "to_date": "2025-12-31" },
+                "last year": { "from_date": "2024-01-01", "to_date": "2024-12-31" },
+                "the week before last": { "from_date": "2025-01-06", "to_date": "2025-01-12" },
+                "next business day": { "from_date": "2025-01-23", "to_date": "2025-01-23" },
+                "end of month": { "from_date": "2025-01-31", "to_date": "2025-01-31" },
+                "beginning of quarter": { "from_date": "2025-01-01", "to_date": "2025-01-01" }
               },
-              request: `Please calculate the exact from_date and to_date in YYYY-MM-DD format for the expression: "${expression}". Return ONLY the JSON object with from_date and to_date fields.`
+              request: `Please calculate the exact from_date and to_date in YYYY-MM-DD format for the expression: "${expression}". Return ONLY the JSON object with from_date and to_date fields. Use the current date (${formatDate(today)}) as reference.`
             }, null, 2)
           }]
         };
@@ -822,14 +826,154 @@ server.tool(
         return { content: [{ type: "text", text: `Error fetching customers: ${data.message}` }] };
       }
 
+      const customers = data.result || data.data || [];
+      
+      // If search term is provided, try to find exact matches first
+      if (search && customers.length > 1) {
+        const searchLower = search.toLowerCase().trim();
+        
+        // Look for exact name matches first
+        const exactNameMatches = customers.filter((customer: any) => {
+          const customerName = (customer.customer_name || customer.name || '').toLowerCase();
+          const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
+          return customerName === searchLower || companyName === searchLower;
+        });
+        
+        if (exactNameMatches.length === 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Found exact match for "${search}":\n\n${JSON.stringify(exactNameMatches[0], null, 2)}`,
+              },
+            ],
+          };
+        }
+        
+        // If no exact match, look for partial name matches
+        const partialNameMatches = customers.filter((customer: any) => {
+          const customerName = (customer.customer_name || customer.name || '').toLowerCase();
+          const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
+          return customerName.includes(searchLower) || companyName.includes(searchLower);
+        });
+        
+        if (partialNameMatches.length === 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Found 1 customer matching "${search}":\n\n${JSON.stringify(partialNameMatches[0], null, 2)}`,
+              },
+            ],
+          };
+        }
+        
+        // If multiple matches, show them but indicate it's not exact
+        if (partialNameMatches.length > 1) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Found ${partialNameMatches.length} customers matching "${search}":\n\n${JSON.stringify(partialNameMatches, null, 2)}\n\n💡 For more precise results, try searching with the full name or use a more specific search term.`,
+              },
+            ],
+          };
+        }
+      }
+
       return {
         content: [
           {
             type: "text",
-            text: `Found ${data.result?.length || data.data?.length || 0} customers:\n\n${JSON.stringify(data.result || data.data || [], null, 2)}\n\n📋 Use search parameter to filter customers by name, email, phone, or company.`,
+            text: `Found ${customers.length} customers:\n\n${JSON.stringify(customers, null, 2)}\n\n📋 Use search parameter to filter customers by name, email, phone, or company.`,
           },
         ],
       };
+    } catch (error: any) {
+      return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+    }
+  }
+);
+
+// Find Customer by Exact Name Tool
+server.tool(
+  "findCustomerByName",
+  "Find a specific customer by exact name match",
+  {
+    customer_name: z.string().describe("Exact customer name to search for"),
+  },
+  async ({ customer_name }) => {
+    try {
+      // First, search for customers with the name
+      const searchData = await callIMPApi("/api/customer_list", {
+        search: customer_name,
+        take: 50
+      });
+
+      if (!searchData.success) {
+        return { content: [{ type: "text", text: `Error searching for customer: ${searchData.message}` }] };
+      }
+
+      const customers = searchData.result || searchData.data || [];
+      const searchLower = customer_name.toLowerCase().trim();
+      
+      // Look for exact name matches
+      const exactMatches = customers.filter((customer: any) => {
+        const customerName = (customer.customer_name || customer.name || '').toLowerCase();
+        const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
+        return customerName === searchLower || companyName === searchLower;
+      });
+      
+      if (exactMatches.length === 1) {
+        return {
+          content: [{
+            type: "text",
+            text: `Found exact match for "${customer_name}":\n\n${JSON.stringify(exactMatches[0], null, 2)}`
+          }]
+        };
+      }
+      
+      if (exactMatches.length > 1) {
+        return {
+          content: [{
+            type: "text",
+            text: `Found ${exactMatches.length} customers with exact name "${customer_name}":\n\n${JSON.stringify(exactMatches, null, 2)}\n\n💡 Please provide more specific information to identify the correct customer.`
+          }]
+        };
+      }
+      
+      // If no exact match, look for partial matches
+      const partialMatches = customers.filter((customer: any) => {
+        const customerName = (customer.customer_name || customer.name || '').toLowerCase();
+        const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
+        return customerName.includes(searchLower) || companyName.includes(searchLower);
+      });
+      
+      if (partialMatches.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `No customers found matching "${customer_name}". Please check the spelling or try a different search term.`
+          }]
+        };
+      }
+      
+      if (partialMatches.length === 1) {
+        return {
+          content: [{
+            type: "text",
+            text: `Found 1 customer matching "${customer_name}":\n\n${JSON.stringify(partialMatches[0], null, 2)}`
+          }]
+        };
+      }
+      
+      return {
+        content: [{
+          type: "text",
+          text: `Found ${partialMatches.length} customers matching "${customer_name}":\n\n${JSON.stringify(partialMatches, null, 2)}\n\n💡 For more precise results, try searching with the full name.`
+        }]
+      };
+
     } catch (error: any) {
       return { content: [{ type: "text", text: `Error: ${error.message}` }] };
     }
