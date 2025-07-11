@@ -330,9 +330,9 @@ export function registerUtilityTools(server: McpServer) {
 
   server.tool(
     "calculateDateRangeFromExpression",
-    "Convert natural language date expressions to actual date ranges using Claude's understanding",
+    "Convert natural language date expressions or exact dates to actual date ranges using Claude's intelligence",
     {
-      expression: z.string().describe("Natural language date expression (e.g., 'last week', 'this quarter', 'past 30 days')"),
+      expression: z.string().describe("Natural language date expression (e.g., 'last week', 'this quarter', 'past 30 days') or exact dates (e.g., '2024-03-01 to 2025-02-28', '2024-01-15')"),
       reference_date: z.string().optional().describe("Reference date (YYYY-MM-DD format, defaults to today)"),
     },
     async ({ expression, reference_date }) => {
@@ -349,26 +349,94 @@ export function registerUtilityTools(server: McpServer) {
           return date.toISOString().split('T')[0];
         };
 
-        // Let Claude handle all date expression interpretation
+        // Handle exact date formats first (these are reliable and don't need Claude)
+        const exactDateMatch = expression.match(/^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/i);
+        if (exactDateMatch) {
+          const fromDate = new Date(exactDateMatch[1]);
+          const toDate = new Date(exactDateMatch[2]);
+          
+          if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  error: "Invalid date format in range",
+                  expression: expression,
+                  supported_formats: ["YYYY-MM-DD to YYYY-MM-DD"]
+                }, null, 2)
+              }]
+            };
+          }
+          
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                from_date: exactDateMatch[1],
+                to_date: exactDateMatch[2],
+                expression: expression,
+                type: "exact_dates",
+                days_difference: Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24))
+              }, null, 2)
+            }]
+          };
+        }
+
+        // Handle single date format (also reliable)
+        const singleDateMatch = expression.match(/^\d{4}-\d{2}-\d{2}$/);
+        if (singleDateMatch) {
+          const date = new Date(expression);
+          if (isNaN(date.getTime())) {
+            return {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  error: "Invalid date format",
+                  expression: expression,
+                  supported_formats: ["YYYY-MM-DD"]
+                }, null, 2)
+              }]
+            };
+          }
+          
+          return {
+            content: [{
+              type: "text",
+              text: JSON.stringify({
+                from_date: expression,
+                to_date: expression,
+                expression: expression,
+                type: "single_date"
+              }, null, 2)
+            }]
+          };
+        }
+
+        // For all natural language expressions, use Claude's intelligence
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              instruction: "Please interpret this natural language date expression and calculate the actual date range.",
+              instruction: "Please interpret this natural language date expression and calculate the actual date range. Return ONLY a JSON object with from_date and to_date in YYYY-MM-DD format.",
               expression: expression,
               reference_date: formatDate(refDate),
               current_date: formatDate(today),
               examples: {
-                "last week": "from_date: 7 days ago from reference, to_date: end of that week",
-                "this month": "from_date: first day of current month, to_date: last day of current month",
-                "past 30 days": "from_date: 30 days ago from reference, to_date: reference date",
-                "next week": "from_date: next Monday, to_date: next Sunday",
-                "this quarter": "from_date: first day of current quarter, to_date: last day of current quarter",
-                "yesterday": "from_date: yesterday, to_date: yesterday",
-                "tomorrow": "from_date: tomorrow, to_date: tomorrow",
-                "today": "from_date: today, to_date: today"
+                "last week": { "from_date": "2024-01-15", "to_date": "2024-01-21" },
+                "this month": { "from_date": "2024-01-01", "to_date": "2024-01-31" },
+                "past 30 days": { "from_date": "2023-12-23", "to_date": "2024-01-22" },
+                "next week": { "from_date": "2024-01-29", "to_date": "2024-02-04" },
+                "this quarter": { "from_date": "2024-01-01", "to_date": "2024-03-31" },
+                "yesterday": { "from_date": "2024-01-21", "to_date": "2024-01-21" },
+                "tomorrow": { "from_date": "2024-01-23", "to_date": "2024-01-23" },
+                "today": { "from_date": "2024-01-22", "to_date": "2024-01-22" },
+                "last 1 week": { "from_date": "2024-01-15", "to_date": "2024-01-22" },
+                "last month": { "from_date": "2023-12-01", "to_date": "2023-12-31" },
+                "next month": { "from_date": "2024-02-01", "to_date": "2024-02-29" },
+                "this year": { "from_date": "2024-01-01", "to_date": "2024-12-31" },
+                "last year": { "from_date": "2023-01-01", "to_date": "2023-12-31" }
               },
-              request: "Please calculate the actual from_date and to_date in YYYY-MM-DD format for the expression: " + expression
+              request: `Please calculate the exact from_date and to_date in YYYY-MM-DD format for the expression: "${expression}". Return ONLY the JSON object with from_date and to_date fields.`
             }, null, 2)
           }]
         };
@@ -552,113 +620,7 @@ server.tool(
   }
 );
 
-// Calculate Date Range Tool
-server.tool(
-  "calculateDateRange",
-  "Calculate date range from natural language expressions or specific dates",
-  {
-    date_expression: z.string().describe("Natural language date expression (e.g., 'last week', 'past 30 days', '2024-03-01 to 2025-02-28', 'this month', 'next week')"),
-  },
-  async ({ date_expression }) => {
-    try {
-      const today = new Date();
-      
-      // Helper function to format date as YYYY-MM-DD
-      const formatDate = (date: Date): string => {
-        return date.toISOString().split('T')[0];
-      };
 
-      // Simple validation for exact date formats only
-      const exactDateMatch = date_expression.match(/^(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})$/i);
-      if (exactDateMatch) {
-        const fromDate = new Date(exactDateMatch[1]);
-        const toDate = new Date(exactDateMatch[2]);
-        
-        if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime())) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                error: "Invalid date format in range",
-                expression: date_expression,
-                supported_formats: ["YYYY-MM-DD to YYYY-MM-DD"]
-              }, null, 2)
-            }]
-          };
-        }
-        
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              from_date: exactDateMatch[1],
-              to_date: exactDateMatch[2],
-              expression: date_expression,
-              type: "exact_dates",
-              days_difference: Math.ceil((toDate.getTime() - fromDate.getTime()) / (1000 * 60 * 60 * 24))
-            }, null, 2)
-          }]
-        };
-      }
-
-      // Single date validation
-      const singleDateMatch = date_expression.match(/^\d{4}-\d{2}-\d{2}$/);
-      if (singleDateMatch) {
-        const date = new Date(date_expression);
-        if (isNaN(date.getTime())) {
-          return {
-            content: [{
-              type: "text",
-              text: JSON.stringify({
-                error: "Invalid date format",
-                expression: date_expression,
-                supported_formats: ["YYYY-MM-DD"]
-              }, null, 2)
-            }]
-          };
-        }
-        
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              from_date: date_expression,
-              to_date: date_expression,
-              expression: date_expression,
-              type: "single_date"
-            }, null, 2)
-          }]
-        };
-      }
-
-      // For all natural language expressions, let Claude handle the interpretation
-      return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({
-            instruction: "Please interpret this natural language date expression and return the corresponding date range in YYYY-MM-DD format.",
-            expression: date_expression,
-            current_date: formatDate(today),
-            examples: {
-              "last week": "from_date: 7 days ago, to_date: today",
-              "this month": "from_date: first day of current month, to_date: last day of current month",
-              "past 30 days": "from_date: 30 days ago, to_date: today",
-              "next week": "from_date: next Monday, to_date: next Sunday",
-              "this quarter": "from_date: first day of current quarter, to_date: last day of current quarter",
-              "yesterday": "from_date: yesterday, to_date: yesterday",
-              "tomorrow": "from_date: tomorrow, to_date: tomorrow",
-              "today": "from_date: today, to_date: today"
-            },
-            request: "Please calculate the actual from_date and to_date in YYYY-MM-DD format for the expression: " + date_expression
-          }, null, 2)
-        }]
-      };
-
-    } catch (error: any) {
-      return { content: [{ type: "text", text: `Error: ${error.message}` }] };
-    }
-  }
-);
 
 // Search Invoice List Tool
 server.tool(
