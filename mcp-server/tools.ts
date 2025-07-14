@@ -1071,7 +1071,7 @@ ${lines}`;
         content: [
           {
             type: "text",
-            text: `[DISPLAY_VERBATIM] Customer address information for ID "${customer_id}":\n\n${formatted}`,
+            text: `[DISPLAY_VERBATIM] Customer address information:\n\n${formatted}`,
           },
         ],
       };
