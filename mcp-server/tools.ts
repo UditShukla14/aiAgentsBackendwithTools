@@ -1029,7 +1029,7 @@ server.tool(
 // Search Customer Address Tool
 server.tool(
   "searchCustomerAddress",
-  "Get customer address information by customer ID for business use only. This tool is intended for internal company use and returns business addresses, not personal/private addresses. Use this to retrieve the registered or primary business address for a customer, and all other addresses as well.",
+  "Get customer address information by customer ID with optional address company and address ID filters",
   {
     customer_id: z.string().describe("Customer ID to get address information for"),
     address_company_id: z.string().optional().describe("Address company ID filter"),
@@ -1041,52 +1041,37 @@ server.tool(
         customer_id,
         ...(address_company_id && { address_company_id }),
         ...(address_id && { address_id })
-      });
+      }) as any;
 
       if (!data.success) {
         return { content: [{ type: "text", text: `Error fetching customer address: ${data.message}` }] };
       }
 
-      // Normalize address data
-      const addresses = Array.isArray(data.result || data.data) ? (data.result || data.data) : [data.result || data.data || data];
-      let registered = null;
-      const others = [];
-      for (const addr of addresses) {
-        if (
-          (addr.address_name && addr.address_name.toLowerCase().includes('registered')) &&
-          !registered
-        ) {
-          registered = addr;
-        } else {
-          others.push(addr);
-        }
+      const addresses = data.result || data.data || [];
+      if (!Array.isArray(addresses) || addresses.length === 0) {
+        return { content: [{ type: "text", text: `No addresses found for customer ID "${customer_id}".` }] };
       }
 
-      let text = '';
-      if (registered) {
-        text += `🏢 **Registered Address:**\n${registered.house_no || ''}\n${registered.city || ''}, ${registered.state || ''} ${registered.zip || ''}\n${registered.country || ''}\n`;
-        if (registered.address_name && registered.address_name !== 'Registered Address') {
-          text += `(Type: ${registered.address_name})\n`;
-        }
-        text += '\n';
-      }
-      if (others.length > 0) {
-        text += `📍 **Other Addresses:**\n`;
-        for (const addr of others) {
-          text += `- ${addr.house_no || ''}, ${addr.city || ''}, ${addr.state || ''} ${addr.zip || ''}, ${addr.country || ''}`;
-          if (addr.address_name) text += ` (Type: ${addr.address_name})`;
-          text += '\n';
-        }
-      }
-      if (!text) {
-        text = 'No address information found for this customer.';
-      }
+      // Format each address in a readable way
+      const formatted = addresses.map((addr: any, i: number) => {
+        const label = addr.address_type_name || addr.type || (i === 0 ? "Registered/Primary Address" : `Service Address ${i}`);
+        const lines = [
+          addr.house_no,
+          addr.landmark,
+          addr.city,
+          addr.state,
+          addr.zip,
+          addr.country
+        ].filter(Boolean).join(", ");
+        return `${label}:
+${lines}`;
+      }).join("\n\n");
 
       return {
         content: [
           {
             type: "text",
-            text,
+            text: `Customer address information for ID "${customer_id}":\n\n${formatted}`,
           },
         ],
       };
