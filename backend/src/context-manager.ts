@@ -381,30 +381,26 @@ export class ContextManager {
     const enhancedArgs = { ...originalArgs };
     const hasReference = this.detectPronounReference(currentQuery);
 
-    // Auto-fill based on active entities and references
-    switch (toolName) {
-      case 'searchCustomerAddress':
-      case 'getCustomerDetails':
-        if (!enhancedArgs.customer_id && hasReference && context.activeEntities.customerId) {
-          enhancedArgs.customer_id = context.activeEntities.customerId;
-          console.log(`🧠 Auto-filled customer_id: ${context.activeEntities.customerId}`);
-        }
-        break;
+    // Always try to fill customer_id for any customer-related tool if pronoun is detected
+    if (
+      hasReference &&
+      context.activeEntities.customerId &&
+      !enhancedArgs.customer_id &&
+      /customer|address|contact|details|info|find/i.test(toolName)
+    ) {
+      enhancedArgs.customer_id = context.activeEntities.customerId;
+      console.log(`🧠 Auto-filled customer_id: ${context.activeEntities.customerId} for tool: ${toolName}`);
+    }
 
+    // Existing logic for other entities
+    switch (toolName) {
       case 'searchEstimateList':
       case 'searchInvoiceList':
         if (!enhancedArgs.search && hasReference && context.activeEntities.customerName) {
           enhancedArgs.search = context.activeEntities.customerName;
           console.log(`🧠 Auto-filled search: ${context.activeEntities.customerName}`);
         }
-        
-        // Let the AI handle date calculations with proper tools instead of auto-inference
-        // This ensures accurate date calculations and proper tool usage
-        // const dateRange = this.inferDateRange([currentQuery]);
-        // if (dateRange.from) enhancedArgs.from_date = dateRange.from;
-        // if (dateRange.to) enhancedArgs.to_date = dateRange.to;
         break;
-
       case 'getProductDetails':
         if (!enhancedArgs.product_id && hasReference && context.activeEntities.productId) {
           enhancedArgs.product_id = context.activeEntities.productId;

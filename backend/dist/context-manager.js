@@ -1,7 +1,10 @@
 import Redis from 'ioredis';
 export class ContextManager {
     redis;
-    sessionTTL = 24 * 60 * 60; // 24 hours in seconds
+    sessionTTL = 24 * 60 * 60; // 24 hours
+    maxMessages = 15; // Reduced from 50
+    maxToolHistory = 5; // Reduced from 20
+    messageCompressionThreshold = 10; // Compress after 10 messages
     constructor() {
         this.redis = new Redis({
             host: process.env.REDIS_HOST || 'localhost',
@@ -21,6 +24,7 @@ export class ContextManager {
             userId,
             messages: [],
             toolUsageHistory: [],
+            activeEntities: { lastUpdated: Date.now() },
             userPreferences: {},
             lastActivity: Date.now(),
         };
@@ -31,228 +35,366 @@ export class ContextManager {
         if (!data)
             return null;
         const context = JSON.parse(data);
-        // Update TTL on access
         await this.redis.expire(`session:${sessionId}`, this.sessionTTL);
         return context;
     }
-    // Message Management
+    // Optimized Message Management
     async addMessage(sessionId, role, content, toolsUsed) {
         const context = await this.getSession(sessionId);
         if (!context)
             return;
+        // Compress content if it's too long
+        const compressedContent = this.compressContent(content);
         context.messages.push({
             role,
-            content,
+            content: compressedContent,
             timestamp: Date.now(),
             toolsUsed,
         });
-        // Keep only last 50 messages to manage memory
-        if (context.messages.length > 50) {
-            context.messages = context.messages.slice(-50);
-        }
+        // Apply intelligent pruning
+        context.messages = this.pruneMessages(context.messages);
         context.lastActivity = Date.now();
-        await this.redis.setex(`session:${sessionId}`, this.sessionTTL, JSON.stringify(context));
+        await this.saveContext(sessionId, context);
     }
-    // Tool Usage Tracking
+    // Intelligent message pruning
+    pruneMessages(messages) {
+        if (messages.length <= this.maxMessages)
+            return messages;
+        // Keep system messages and recent messages
+        const systemMessages = messages.filter(m => m.role === 'system').slice(-2);
+        const recentMessages = messages.filter(m => m.role !== 'system').slice(-this.maxMessages);
+        // Compress older messages into summaries
+        const olderMessages = messages.slice(0, -this.maxMessages);
+        const summary = this.summarizeMessages(olderMessages);
+        if (summary) {
+            return [
+                {
+                    role: 'system',
+                    content: `Previous conversation summary: ${summary}`,
+                    timestamp: Date.now(),
+                    summary: summary
+                },
+                ...systemMessages,
+                ...recentMessages
+            ];
+        }
+        return [...systemMessages, ...recentMessages];
+    }
+    // Compress long content
+    compressContent(content, maxLength = 500) {
+        if (content.length <= maxLength)
+            return content;
+        // Extract key information
+        const keyInfo = this.extractKeyInformation(content);
+        if (keyInfo.length < content.length * 0.7) {
+            return keyInfo;
+        }
+        // If still too long, truncate intelligently
+        return content.substring(0, maxLength - 20) + '... [truncated]';
+    }
+    // Extract key information from content
+    extractKeyInformation(content) {
+        // Remove redundant whitespace
+        let compressed = content.replace(/\s+/g, ' ').trim();
+        // Remove common filler phrases
+        const fillerPhrases = [
+            'I understand that',
+            'Let me help you with',
+            'Based on the search results',
+            'Here\'s what I found',
+            'According to the data',
+        ];
+        fillerPhrases.forEach(phrase => {
+            compressed = compressed.replace(new RegExp(phrase + '[^.]*\\.\\s*', 'gi'), '');
+        });
+        // Extract JSON data more efficiently
+        const jsonMatch = compressed.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+            try {
+                const data = JSON.parse(jsonMatch[0]);
+                // Keep only essential fields
+                const essential = this.extractEssentialData(data);
+                compressed = compressed.replace(jsonMatch[0], JSON.stringify(essential));
+            }
+            catch (e) {
+                // Not valid JSON, continue
+            }
+        }
+        return compressed;
+    }
+    // Extract only essential data from results
+    extractEssentialData(data) {
+        if (Array.isArray(data)) {
+            return data.slice(0, 3).map(item => ({
+                id: item.id,
+                name: item.name || item.customer_name || item.product_name,
+                key_field: item.invoice_number || item.estimate_number || item.email
+            }));
+        }
+        // For single objects, keep only key fields
+        const essential = {};
+        const keyFields = ['id', 'name', 'customer_name', 'product_name', 'email',
+            'invoice_number', 'estimate_number', 'total', 'status'];
+        keyFields.forEach(field => {
+            if (data[field] !== undefined) {
+                essential[field] = data[field];
+            }
+        });
+        return essential;
+    }
+    // Optimized Tool Usage Recording
     async recordToolUsage(sessionId, toolName, args, result) {
         const context = await this.getSession(sessionId);
         if (!context)
             return;
+        // Extract and store only essential information
+        const resultSummary = this.summarizeToolResult(toolName, result);
+        const resultIds = this.extractIdsFromResult(result);
         context.toolUsageHistory.push({
             toolName,
-            args,
-            result,
+            args: this.compressArgs(args), // Compress args too
+            resultSummary,
+            resultIds,
             timestamp: Date.now(),
         });
-        // Keep only last 20 tool usages
-        if (context.toolUsageHistory.length > 20) {
-            context.toolUsageHistory = context.toolUsageHistory.slice(-20);
+        // Keep only recent tool usage
+        if (context.toolUsageHistory.length > this.maxToolHistory) {
+            context.toolUsageHistory = context.toolUsageHistory.slice(-this.maxToolHistory);
         }
+        // Update active entities
+        this.updateActiveEntities(context, toolName, result);
         context.lastActivity = Date.now();
-        await this.redis.setex(`session:${sessionId}`, this.sessionTTL, JSON.stringify(context));
-        // Also store tool-specific usage patterns
-        await this.updateToolPatterns(toolName, args, result);
+        await this.saveContext(sessionId, context);
+        // Cache result separately for quick access
+        await this.cacheToolResult(toolName, args, result);
     }
-    // Generate Context for Tools
+    // Compress tool arguments
+    compressArgs(args) {
+        const compressed = { ...args };
+        // Remove context metadata
+        delete compressed._context;
+        // Keep only essential fields
+        return compressed;
+    }
+    // Summarize tool results instead of storing full data
+    summarizeToolResult(toolName, result) {
+        if (!result || !result.content)
+            return '';
+        try {
+            const content = result.content[0]?.text;
+            if (!content)
+                return '';
+            const data = JSON.parse(content);
+            const resultData = data.result;
+            if (Array.isArray(resultData)) {
+                return `Found ${resultData.length} ${toolName.replace('search', '').replace('List', '')}(s)`;
+            }
+            else if (resultData && typeof resultData === 'object') {
+                const key = resultData.name || resultData.customer_name || resultData.product_name;
+                return key ? `Found: ${key}` : 'Found 1 result';
+            }
+        }
+        catch (e) {
+            return 'Result processed';
+        }
+        return '';
+    }
+    // Extract IDs for reference
+    extractIdsFromResult(result) {
+        const ids = [];
+        try {
+            const content = result.content?.[0]?.text;
+            if (!content)
+                return ids;
+            const data = JSON.parse(content);
+            const resultData = data.result;
+            if (Array.isArray(resultData)) {
+                resultData.forEach((item) => {
+                    if (item.id)
+                        ids.push(item.id.toString());
+                });
+            }
+            else if (resultData?.id) {
+                ids.push(resultData.id.toString());
+            }
+        }
+        catch (e) {
+            // Ignore parsing errors
+        }
+        return ids.slice(0, 5); // Keep max 5 IDs
+    }
+    // Update active entities efficiently
+    updateActiveEntities(context, toolName, result) {
+        try {
+            const content = result.content?.[0]?.text;
+            if (!content)
+                return;
+            const data = JSON.parse(content);
+            const resultData = data.result;
+            // Update based on tool type
+            if (toolName.includes('Customer') && resultData) {
+                if (Array.isArray(resultData) && resultData.length > 0) {
+                    const latest = resultData[resultData.length - 1];
+                    context.activeEntities.customerId = latest.id?.toString();
+                    context.activeEntities.customerName = latest.customer_name || latest.name;
+                }
+                else if (resultData.id) {
+                    context.activeEntities.customerId = resultData.id.toString();
+                    context.activeEntities.customerName = resultData.customer_name || resultData.name;
+                }
+                context.activeEntities.lastUpdated = Date.now();
+            }
+            if (toolName.includes('Product') && resultData) {
+                if (Array.isArray(resultData) && resultData.length > 0) {
+                    const latest = resultData[resultData.length - 1];
+                    context.activeEntities.productId = latest.id?.toString();
+                    context.activeEntities.productName = latest.product_name || latest.name;
+                }
+                else if (resultData.id) {
+                    context.activeEntities.productId = resultData.id.toString();
+                    context.activeEntities.productName = resultData.product_name || resultData.name;
+                }
+                context.activeEntities.lastUpdated = Date.now();
+            }
+        }
+        catch (e) {
+            // Ignore parsing errors
+        }
+    }
+    // Optimized context generation
     async generateToolContext(sessionId, currentQuery) {
         const context = await this.getSession(sessionId);
         if (!context) {
             return {
                 recentQueries: [currentQuery],
-                relatedData: {},
+                activeEntities: {},
                 userIntent: 'unknown',
-                previousResults: [],
             };
         }
-        const recentMessages = context.messages.slice(-10);
+        // Get only essential recent queries
+        const recentMessages = context.messages.slice(-5);
         const recentQueries = recentMessages
             .filter(m => m.role === 'user')
-            .map(m => m.content);
-        const recentToolUsage = context.toolUsageHistory.slice(-5);
-        const previousResults = recentToolUsage.map(t => t.result);
-        // Simple intent detection based on recent queries
+            .map(m => m.content.substring(0, 100)); // Limit query length
         const userIntent = this.detectIntent([...recentQueries, currentQuery]);
-        // Extract related data from recent tool usage
-        const relatedData = this.extractRelatedData(recentToolUsage, currentQuery);
         return {
             recentQueries: [...recentQueries, currentQuery],
-            relatedData,
+            activeEntities: context.activeEntities,
             userIntent,
-            previousResults,
         };
     }
-    // Context-Aware Tool Argument Enhancement
+    // Simplified argument enhancement
     async enhanceToolArguments(sessionId, toolName, originalArgs, currentQuery) {
-        const toolContext = await this.generateToolContext(sessionId, currentQuery);
+        const context = await this.getSession(sessionId);
+        if (!context)
+            return originalArgs;
         const enhancedArgs = { ...originalArgs };
-        // Extract entity references from context
-        const contextEntities = this.extractEntitiesFromContext(toolContext);
-        // Tool-specific context enhancement
+        const hasReference = this.detectPronounReference(currentQuery);
+        // Always try to fill customer_id for any customer-related tool if pronoun is detected
+        if (hasReference &&
+            context.activeEntities.customerId &&
+            !enhancedArgs.customer_id &&
+            /customer|address|contact|details|info|find/i.test(toolName)) {
+            enhancedArgs.customer_id = context.activeEntities.customerId;
+            console.log(`🧠 Auto-filled customer_id: ${context.activeEntities.customerId} for tool: ${toolName}`);
+        }
+        // Existing logic for other entities
         switch (toolName) {
-            case 'searchProductList':
-                enhancedArgs._context = {
-                    recentSearches: this.extractProductSearches(toolContext.recentQueries),
-                    userIntent: toolContext.userIntent,
-                };
-                break;
-            case 'searchCustomerList':
-                enhancedArgs._context = {
-                    recentCustomers: this.extractCustomerData(toolContext.previousResults),
-                    userIntent: toolContext.userIntent,
-                };
-                break;
-            case 'searchCustomerAddress':
-                // Auto-fill customer_id if missing but referenced in context
-                if (!enhancedArgs.customer_id && contextEntities.lastCustomerId) {
-                    enhancedArgs.customer_id = contextEntities.lastCustomerId;
-                    console.log(`🧠 Context: Auto-filled customer_id ${contextEntities.lastCustomerId} from recent context`);
-                }
-                enhancedArgs._context = {
-                    recentCustomer: contextEntities.lastCustomerName,
-                    userIntent: toolContext.userIntent,
-                };
-                break;
             case 'searchEstimateList':
             case 'searchInvoiceList':
-                // Auto-fill customer info if context suggests it
-                const hasCustomerReference = this.detectPronounReference(currentQuery) ||
-                    currentQuery.toLowerCase().includes('customer');
-                if (!enhancedArgs.search && hasCustomerReference) {
-                    // Try to use the most recent customer info
-                    const customerName = contextEntities.lastCustomerName || contextEntities.mentionedCustomer;
-                    if (customerName) {
-                        enhancedArgs.search = customerName;
-                        console.log(`🧠 Context: Auto-filled search with customer "${customerName}" from context reference`);
-                    }
+                if (!enhancedArgs.search && hasReference && context.activeEntities.customerName) {
+                    enhancedArgs.search = context.activeEntities.customerName;
+                    console.log(`🧠 Auto-filled search: ${context.activeEntities.customerName}`);
                 }
-                enhancedArgs._context = {
-                    dateRange: this.inferDateRange(toolContext.recentQueries),
-                    userIntent: toolContext.userIntent,
-                    recentCustomer: contextEntities.lastCustomerName || contextEntities.mentionedCustomer,
-                    recentCustomerId: contextEntities.lastCustomerId,
-                };
                 break;
             case 'getProductDetails':
-                // Auto-fill product_id if missing but referenced in context
-                if (!enhancedArgs.product_id && contextEntities.lastProductId) {
-                    enhancedArgs.product_id = contextEntities.lastProductId;
-                    console.log(`🧠 Context: Auto-filled product_id ${contextEntities.lastProductId} from recent context`);
+                if (!enhancedArgs.product_id && hasReference && context.activeEntities.productId) {
+                    enhancedArgs.product_id = context.activeEntities.productId;
+                    console.log(`🧠 Auto-filled product_id: ${context.activeEntities.productId}`);
                 }
-                enhancedArgs._context = {
-                    recentProduct: contextEntities.lastProductName,
-                    userIntent: toolContext.userIntent,
-                };
                 break;
-            default:
-                enhancedArgs._context = {
-                    recentQueries: toolContext.recentQueries.slice(-3),
-                    userIntent: toolContext.userIntent,
-                    entities: contextEntities,
-                };
         }
         return enhancedArgs;
     }
-    // Extract entities (IDs, names) from recent context
-    extractEntitiesFromContext(toolContext) {
-        const entities = {};
-        // Extract from previous tool results
-        toolContext.previousResults.forEach(result => {
-            if (result && result.content && Array.isArray(result.content)) {
-                result.content.forEach((content) => {
-                    if (content.type === 'text' && content.text) {
-                        try {
-                            const data = JSON.parse(content.text);
-                            // Extract customer information
-                            if (data.result && Array.isArray(data.result)) {
-                                const customers = data.result.filter((item) => item.customer_name || item.id || item.customer_id);
-                                if (customers.length > 0) {
-                                    const lastCustomer = customers[customers.length - 1];
-                                    entities.lastCustomerId = lastCustomer.id || lastCustomer.customer_id;
-                                    entities.lastCustomerName = lastCustomer.customer_name || lastCustomer.name;
-                                    entities.lastCustomerEmail = lastCustomer.email;
-                                }
-                            }
-                            // Extract single customer details
-                            if (data.result && data.result.customer_name) {
-                                entities.lastCustomerId = data.result.id || data.result.customer_id;
-                                entities.lastCustomerName = data.result.customer_name;
-                                entities.lastCustomerEmail = data.result.email;
-                            }
-                            // Extract product information
-                            if (data.result && Array.isArray(data.result)) {
-                                const products = data.result.filter((item) => item.product_name || item.name);
-                                if (products.length > 0) {
-                                    const lastProduct = products[products.length - 1];
-                                    entities.lastProductId = lastProduct.id || lastProduct.product_id;
-                                    entities.lastProductName = lastProduct.product_name || lastProduct.name;
-                                }
-                            }
-                            // Extract invoice/estimate information
-                            if (data.result && Array.isArray(data.result)) {
-                                const documents = data.result.filter((item) => item.invoice_number || item.estimate_number);
-                                if (documents.length > 0) {
-                                    const lastDoc = documents[documents.length - 1];
-                                    entities.lastDocumentId = lastDoc.id;
-                                    entities.lastDocumentNumber = lastDoc.invoice_number || lastDoc.estimate_number;
-                                    entities.lastDocumentCustomer = lastDoc.customer_name;
-                                }
-                            }
-                        }
-                        catch (e) {
-                            // Not JSON, try to extract names from text directly
-                            const text = content.text.toLowerCase();
-                            // Look for customer mentions in text
-                            const customerMatch = text.match(/customer.*?([a-z]+ [a-z]+)/i);
-                            if (customerMatch) {
-                                entities.mentionedCustomer = customerMatch[1];
-                            }
-                        }
-                    }
-                });
-            }
+    // Summarize messages for compression
+    summarizeMessages(messages) {
+        if (messages.length === 0)
+            return '';
+        const topics = new Set();
+        const entities = new Set();
+        messages.forEach(msg => {
+            // Extract topics
+            if (msg.content.includes('customer'))
+                topics.add('customers');
+            if (msg.content.includes('product'))
+                topics.add('products');
+            if (msg.content.includes('invoice'))
+                topics.add('invoices');
+            if (msg.content.includes('estimate'))
+                topics.add('estimates');
+            // Extract entity names
+            const names = msg.content.match(/[A-Z][a-z]+ [A-Z][a-z]+/g);
+            if (names)
+                names.forEach(name => entities.add(name));
         });
-        // Also extract from recent conversation messages
-        const recentMessages = toolContext.recentQueries.slice(-5);
-        recentMessages.forEach(message => {
-            const lowerMsg = message.toLowerCase();
-            // Extract customer names mentioned in conversation
-            const customerPatterns = [
-                /customer named ([a-z]+ [a-z]+)/i,
-                /find.*?([a-z]+ [a-z]+)/i,
-                /looking for ([a-z]+ [a-z]+)/i,
-                /about ([a-z]+ [a-z]+)/i
-            ];
-            customerPatterns.forEach(pattern => {
-                const match = message.match(pattern);
-                if (match && match[1] && match[1].length > 3) { // Avoid short false matches
-                    entities.mentionedCustomer = match[1];
-                    console.log(`🧠 Context: Found customer name "${match[1]}" in conversation`);
-                }
-            });
-        });
-        return entities;
+        const summary = `Discussed ${Array.from(topics).join(', ')}`;
+        const entityList = Array.from(entities).slice(0, 3).join(', ');
+        return entityList ? `${summary} regarding ${entityList}` : summary;
     }
-    // Cache Management
+    // Save context with compression
+    async saveContext(sessionId, context) {
+        // Remove old entity data if not recently used
+        const entityAge = Date.now() - context.activeEntities.lastUpdated;
+        if (entityAge > 10 * 60 * 1000) { // 10 minutes
+            context.activeEntities = { lastUpdated: Date.now() };
+        }
+        await this.redis.setex(`session:${sessionId}`, this.sessionTTL, JSON.stringify(context));
+    }
+    // Keep other helper methods but optimize them...
+    detectIntent(queries) {
+        const recentQuery = queries.slice(-3).join(' ').toLowerCase();
+        if (recentQuery.includes('product'))
+            return 'product_inquiry';
+        if (recentQuery.includes('customer'))
+            return 'customer_management';
+        if (recentQuery.includes('invoice'))
+            return 'billing_inquiry';
+        if (recentQuery.includes('estimate'))
+            return 'estimation';
+        return 'general_inquiry';
+    }
+    detectPronounReference(query) {
+        const lowerQuery = query.toLowerCase();
+        const pronouns = ['his', 'her', 'their', 'this', 'that', 'the same'];
+        return pronouns.some(pronoun => lowerQuery.includes(pronoun));
+    }
+    inferDateRange(queries) {
+        const dateRange = {};
+        const query = queries.join(' ').toLowerCase();
+        const today = new Date();
+        // Helper function to format date as YYYY-MM-DD
+        const formatDate = (date) => {
+            return date.toISOString().split('T')[0];
+        };
+        // Only handle very basic patterns, let Claude handle the rest
+        if (query.includes('today')) {
+            dateRange.from = dateRange.to = formatDate(today);
+        }
+        else if (query.includes('yesterday')) {
+            const yesterday = new Date(today);
+            yesterday.setDate(today.getDate() - 1);
+            dateRange.from = dateRange.to = formatDate(yesterday);
+        }
+        else if (query.includes('tomorrow')) {
+            const tomorrow = new Date(today);
+            tomorrow.setDate(today.getDate() + 1);
+            dateRange.from = dateRange.to = formatDate(tomorrow);
+        }
+        // For all other expressions, let Claude handle them in the tool calls
+        // This keeps the context manager simple and leverages Claude's understanding
+        return dateRange;
+    }
+    // Cache management remains the same
     async cacheToolResult(toolName, args, result, ttl = 300) {
         const cacheKey = `cache:${toolName}:${this.hashArgs(args)}`;
         await this.redis.setex(cacheKey, ttl, JSON.stringify(result));
@@ -262,187 +404,10 @@ export class ContextManager {
         const cached = await this.redis.get(cacheKey);
         return cached ? JSON.parse(cached) : null;
     }
-    // Private Helper Methods
-    async updateToolPatterns(toolName, args, result) {
-        const key = `patterns:${toolName}`;
-        const pattern = { args, result, timestamp: Date.now() };
-        await this.redis.lpush(key, JSON.stringify(pattern));
-        await this.redis.ltrim(key, 0, 49); // Keep last 50 patterns
-        await this.redis.expire(key, 7 * 24 * 60 * 60); // 7 days
-    }
-    detectIntent(queries) {
-        const recentQuery = queries.join(' ').toLowerCase();
-        if (recentQuery.includes('product') || recentQuery.includes('item'))
-            return 'product_inquiry';
-        if (recentQuery.includes('customer') || recentQuery.includes('client'))
-            return 'customer_management';
-        if (recentQuery.includes('invoice') || recentQuery.includes('bill'))
-            return 'billing_inquiry';
-        if (recentQuery.includes('estimate') || recentQuery.includes('quote'))
-            return 'estimation';
-        if (recentQuery.includes('calculate') || recentQuery.includes('math'))
-            return 'calculation';
-        if (recentQuery.includes('analyze') || recentQuery.includes('text'))
-            return 'analysis';
-        return 'general_inquiry';
-    }
-    extractRelatedData(toolUsage, currentQuery) {
-        const data = {};
-        toolUsage.forEach(usage => {
-            if (usage.toolName === 'searchProductList' && usage.result) {
-                data.recentProducts = usage.result;
-            }
-            if (usage.toolName === 'searchCustomerList' && usage.result) {
-                data.recentCustomers = usage.result;
-            }
-        });
-        return data;
-    }
-    extractProductSearches(queries) {
-        return queries
-            .filter(q => q.toLowerCase().includes('product') || q.toLowerCase().includes('search'))
-            .slice(-3);
-    }
-    extractCustomerData(results) {
-        return results
-            .filter(r => r && (r.customer_name || r.customers))
-            .slice(-3);
-    }
-    inferDateRange(queries) {
-        const dateRange = {};
-        const recentQuery = queries.join(' ').toLowerCase();
-        const today = new Date();
-        const yesterday = new Date(today);
-        yesterday.setDate(yesterday.getDate() - 1);
-        console.log(`🧠 Context: Processing date query: "${recentQuery}"`);
-        console.log(`🧠 Context: Today is: ${today.toISOString().split('T')[0]}`);
-        // Handle "today"
-        if (recentQuery.includes('today') && !recentQuery.includes('till today')) {
-            const todayStr = today.toISOString().split('T')[0];
-            dateRange.from = todayStr;
-            dateRange.to = todayStr;
-        }
-        // Handle "yesterday" or "last day"
-        else if (recentQuery.includes('yesterday') || recentQuery.includes('last day')) {
-            const yesterdayStr = yesterday.toISOString().split('T')[0];
-            dateRange.from = yesterdayStr;
-            dateRange.to = yesterdayStr;
-        }
-        // Handle "last week till today" or "last week to today"
-        else if (recentQuery.includes('last week') && (recentQuery.includes('till today') || recentQuery.includes('to today'))) {
-            const lastWeekStart = new Date(today);
-            lastWeekStart.setDate(today.getDate() - today.getDay() - 7); // Go back to start of last week
-            dateRange.from = lastWeekStart.toISOString().split('T')[0];
-            dateRange.to = today.toISOString().split('T')[0]; // Till today
-        }
-        // Handle "this week"
-        else if (recentQuery.includes('this week')) {
-            const weekStart = new Date(today);
-            weekStart.setDate(today.getDate() - today.getDay());
-            dateRange.from = weekStart.toISOString().split('T')[0];
-        }
-        // Handle "last week" (just last week, not till today)
-        else if (recentQuery.includes('last week')) {
-            const lastWeekEnd = new Date(today);
-            lastWeekEnd.setDate(today.getDate() - today.getDay() - 1);
-            const lastWeekStart = new Date(lastWeekEnd);
-            lastWeekStart.setDate(lastWeekEnd.getDate() - 6);
-            dateRange.from = lastWeekStart.toISOString().split('T')[0];
-            dateRange.to = lastWeekEnd.toISOString().split('T')[0];
-        }
-        // Handle "this month"
-        else if (recentQuery.includes('this month')) {
-            const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-            dateRange.from = monthStart.toISOString().split('T')[0];
-        }
-        // Handle "last month"
-        else if (recentQuery.includes('last month')) {
-            const lastMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
-            const lastMonthEnd = new Date(today.getFullYear(), today.getMonth(), 0);
-            dateRange.from = lastMonth.toISOString().split('T')[0];
-            dateRange.to = lastMonthEnd.toISOString().split('T')[0];
-        }
-        // Handle "last X days"
-        else if (recentQuery.match(/last (\d+) days?/)) {
-            const match = recentQuery.match(/last (\d+) days?/);
-            if (match) {
-                const days = parseInt(match[1]);
-                const startDate = new Date(today);
-                startDate.setDate(today.getDate() - days);
-                dateRange.from = startDate.toISOString().split('T')[0];
-                dateRange.to = today.toISOString().split('T')[0];
-            }
-        }
-        // Handle explicit date ranges like "20may to 29may" or "may 20 to may 29"
-        else if (recentQuery.match(/(\d{1,2})(\w{3,9})\s*to\s*(\d{1,2})(\w{3,9})/)) {
-            const match = recentQuery.match(/(\d{1,2})(\w{3,9})\s*to\s*(\d{1,2})(\w{3,9})/);
-            if (match) {
-                const [, fromDay, fromMonth, toDay, toMonth] = match;
-                const currentYear = today.getFullYear();
-                try {
-                    const fromDate = this.parseFlexibleDate(fromDay, fromMonth, currentYear);
-                    const toDate = this.parseFlexibleDate(toDay, toMonth, currentYear);
-                    if (fromDate && toDate) {
-                        dateRange.from = fromDate;
-                        dateRange.to = toDate;
-                    }
-                }
-                catch (e) {
-                    console.log('Date parsing error:', e);
-                }
-            }
-        }
-        if (dateRange.from || dateRange.to) {
-            console.log(`🧠 Context: Calculated date range:`, dateRange);
-            console.log(`🧠 Context: Will send to API - from_date: "${dateRange.from}", to_date: "${dateRange.to}"`);
-        }
-        else {
-            console.log(`🧠 Context: No date range inferred from query`);
-        }
-        return dateRange;
-    }
-    // Helper method to parse flexible date formats
-    parseFlexibleDate(day, month, year) {
-        const monthMap = {
-            'jan': 0, 'january': 0,
-            'feb': 1, 'february': 1,
-            'mar': 2, 'march': 2,
-            'apr': 3, 'april': 3,
-            'may': 4,
-            'jun': 5, 'june': 5,
-            'jul': 6, 'july': 6,
-            'aug': 7, 'august': 7,
-            'sep': 8, 'september': 8,
-            'oct': 9, 'october': 9,
-            'nov': 10, 'november': 10,
-            'dec': 11, 'december': 11
-        };
-        const monthName = month.toLowerCase();
-        const monthNumber = monthMap[monthName];
-        if (monthNumber !== undefined) {
-            const date = new Date(year, monthNumber, parseInt(day));
-            return date.toISOString().split('T')[0];
-        }
-        return null;
-    }
     hashArgs(args) {
         return Buffer.from(JSON.stringify(args)).toString('base64').slice(0, 32);
     }
-    // Cleanup
     async cleanup() {
         await this.redis.quit();
-    }
-    // Improved pronoun and reference detection
-    detectPronounReference(query) {
-        const lowerQuery = query.toLowerCase();
-        const pronouns = [
-            'his', 'her', 'their', 'its',
-            'he', 'she', 'they', 'it',
-            'this customer', 'that customer', 'the customer',
-            'this client', 'that client', 'the client',
-            'this person', 'that person',
-            'him', 'them'
-        ];
-        return pronouns.some(pronoun => lowerQuery.includes(pronoun));
     }
 }

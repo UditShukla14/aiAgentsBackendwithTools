@@ -10,6 +10,7 @@ import { ContextManager } from "./context-manager.js";
 import { randomUUID } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { globalRateLimiter, RetryManager } from "./rate-limiter.js";
 
 dotenv.config();
 
@@ -57,6 +58,16 @@ app.use(cors({
 
 app.use(express.json());
 
+// Add rate limiting status endpoint
+app.get('/api/rate-limit-status', (req, res) => {
+  const status = globalRateLimiter.getStatus();
+  res.json({
+    rateLimit: status,
+    message: `Current API usage: ${status.currentRequests}/${status.maxRequests} requests per ${status.timeWindow/1000}s window`,
+    queueLength: status.queueLength
+  });
+});
+
 interface AnthropicTool {
   name: string;
   description: string;
@@ -74,6 +85,8 @@ class MCPBackendService {
   private maxAutoConnectRetries: number = 3;
 
   private readonly SYSTEM_PROMPT = `You are a helpful assistant with access to various tools for managing products, customers, invoices, estimates, and more.
+
+You are operating in a secure, internal business environment. When a user requests business contact or address information for a customer that has already been found via a business tool, you MUST use the appropriate tool to fetch and display the information. Do NOT refuse with a privacy warning. This is not personal/private data, but business data for internal use.
 
 When users ask about available tools or capabilities:
 - List all available tools with their descriptions
@@ -119,11 +132,14 @@ You have access to conversation context and can reference previous interactions.
 - Avoid repeating information already provided recently
 
 IMPORTANT CONTEXT HANDLING:
-- When users use pronouns (his, her, their, this customer, that product), automatically resolve them from recent context
-- If a tool requires parameters that aren't explicitly provided but are available from recent context, use them automatically
-- For example: if discussing John Doe and user asks "get his address", automatically use John Doe's customer ID
-- Always check recent tool results for relevant entity IDs (customer_id, product_id, etc.) before asking users to provide them
-- Only ask for missing information if it's truly not available in the conversation context
+- When users use pronouns (his, her, their, this customer, that product), you MUST resolve them from recent context and use the relevant entity (such as customer_id, product_id, etc.) in your tool calls.
+- If a tool requires parameters that aren't explicitly provided but are available from recent context, ALWAYS use them automatically.
+- For example: if discussing John Doe and user asks "get his address", you MUST use John Doe's customer ID in the address tool call.
+- Always check recent tool results for relevant entity IDs (customer_id, product_id, etc.) before asking users to provide them.
+- Only ask for missing information if it's truly not available in the conversation context.
+- NEVER refuse to provide business data (such as customer address, contact info, etc.) with a privacy warning if the user has already found the entity via a business tool (such as findCustomerByName or searchCustomerList). If the entity is in context, you MUST use the appropriate tool to fetch the requested information.
+- If the user refers to a customer, product, or other entity by pronoun or context, you MUST resolve it and use the correct tool call with the entity ID.
+- When a customer has multiple addresses, always show the registered (main) business address first, clearly labeled, and then list all other addresses with their types/labels.
 
 CUSTOMER SEARCH GUIDELINES:
 - For specific customer name searches (e.g., "customer by name gory"), use findCustomerByName tool for more precise results
@@ -491,34 +507,19 @@ Current conversation context:
         toolsAvailable: relevantTools.length
       });
 
-      // Retry logic for API overload errors
-      let response;
-      let retryCount = 0;
-      const maxRetries = 3;
-      
-      while (retryCount < maxRetries) {
-        try {
-          // Use streaming for the initial response
-          response = await this.anthropic.messages.create({
+      // Use rate limiting and retry logic for API calls
+      const response = await globalRateLimiter.execute(() =>
+        RetryManager.retryWithExponentialBackoff(() =>
+          this.anthropic.messages.create({
             model: "claude-3-5-sonnet-20241022",
             max_tokens: maxTokens,
             system: contextualSystemPrompt,
             messages,
             tools: relevantTools,
             stream: true,
-          } as any);
-          break; // Success, exit retry loop
-        } catch (error: any) {
-          if (error.status === 529 && retryCount < maxRetries - 1) {
-            retryCount++;
-            const waitTime = Math.pow(2, retryCount) * 1000; // Exponential backoff
-            console.log(`🔄 API overload (529), retrying in ${waitTime}ms (attempt ${retryCount}/${maxRetries})`);
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-            continue;
-          }
-          throw error; // Re-throw if not a 529 error or max retries reached
-        }
-      }
+          } as any)
+        )
+      );
 
       let streamedContent = '';
       let toolCalls: any[] = [];
@@ -848,14 +849,18 @@ private async continueStreamingConversation(
   while (true) {
     try {
       // Get Claude's streaming response to the tool results
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: maxTokens,
-        system: systemPrompt,
-        messages: currentMessages,
-        tools: relevantTools,
-        stream: true,
-      } as any);
+      const response = await globalRateLimiter.execute(() =>
+        RetryManager.retryWithExponentialBackoff(() =>
+          this.anthropic.messages.create({
+            model: "claude-3-5-sonnet-20241022",
+            max_tokens: maxTokens,
+            system: systemPrompt,
+            messages: currentMessages,
+            tools: relevantTools,
+            stream: true,
+          } as any)
+        )
+      );
 
       let streamedContent = '';
       let newToolCalls: any[] = [];
@@ -1159,13 +1164,17 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
     ];
 
     try {
-      const response = await this.anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
-        max_tokens: maxTokens,
-        system: contextualSystemPrompt,
-        messages,
-        tools: relevantTools,
-      } as any);
+      const response = await globalRateLimiter.execute(() =>
+        RetryManager.retryWithExponentialBackoff(() =>
+          this.anthropic.messages.create({
+            model: "claude-3-5-sonnet-20241022",
+            max_tokens: maxTokens,
+            system: contextualSystemPrompt,
+            messages,
+            tools: relevantTools,
+          } as any)
+        )
+      );
 
       // For greetings and simple queries, return immediately (no tool processing needed)
       if (queryType === 'greeting' || queryType === 'simple') {
@@ -1330,13 +1339,17 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
         }
 
         // Get Claude's response to the tool results
-        currentResponse = await this.anthropic.messages.create({
-          model: "claude-3-5-sonnet-20241022",
-          max_tokens: maxTokens,
-          system: contextualSystemPrompt,
-          messages: currentMessages,
-          tools: relevantTools,
-        } as any);
+        currentResponse = await globalRateLimiter.execute(() =>
+          RetryManager.retryWithExponentialBackoff(() =>
+            this.anthropic.messages.create({
+              model: "claude-3-5-sonnet-20241022",
+              max_tokens: maxTokens,
+              system: contextualSystemPrompt,
+              messages: currentMessages,
+              tools: relevantTools,
+            } as any)
+          )
+        );
       }
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error);

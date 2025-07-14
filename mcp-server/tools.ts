@@ -14,10 +14,35 @@ const REQUIRED_FIELDS = {
   imp_session_id: "13064|8257622c-1c29-4097-86ec-fb1bf9c7b745",
 };
 
+// Rate limiting configuration
+const RATE_LIMIT = {
+  maxRequests: 10, // Max requests per window
+  windowMs: 60000, // 1 minute window
+  retryDelay: 1000, // 1 second between retries
+  maxRetries: 3
+};
+
+let requestCount = 0;
+let lastResetTime = Date.now();
+
 /**
- * Helper function to make API calls with required fields
+ * Helper function to make API calls with required fields, rate limiting, and retry logic
  */
 async function callIMPApi(endpoint: string, additionalParams: Record<string, any> = {}) {
+  // Rate limiting check
+  const now = Date.now();
+  if (now - lastResetTime > RATE_LIMIT.windowMs) {
+    requestCount = 0;
+    lastResetTime = now;
+  }
+  
+  if (requestCount >= RATE_LIMIT.maxRequests) {
+    const waitTime = RATE_LIMIT.windowMs - (now - lastResetTime);
+    throw new Error(`Rate limit exceeded. Please wait ${Math.ceil(waitTime / 1000)} seconds before making another request.`);
+  }
+  
+  requestCount++;
+
   const params = new URLSearchParams();
   
   // Add all required fields
@@ -34,18 +59,78 @@ async function callIMPApi(endpoint: string, additionalParams: Record<string, any
 
   const url = `${BASE_URL}${endpoint}?${params}`;
 
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "Accept": "application/json"
+  // Retry logic with exponential backoff
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt <= RATE_LIMIT.maxRetries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
+      
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          "Accept": "application/json",
+          "User-Agent": "MCP-Client/1.0"
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+
+      // Handle specific error codes
+      if (response.status === 529) {
+        throw new Error("Server is overloaded. Please try again in a few moments.");
+      }
+      
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After');
+        const waitTime = retryAfter ? parseInt(retryAfter) * 1000 : RATE_LIMIT.retryDelay * (attempt + 1);
+        throw new Error(`Rate limited by server. Please wait ${Math.ceil(waitTime / 1000)} seconds.`);
+      }
+      
+      if (response.status === 503) {
+        throw new Error("Service temporarily unavailable. Please try again later.");
+      }
+
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      
+      // Add delay between successful requests to prevent overwhelming the server
+      if (attempt > 0) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+      
+      return data;
+      
+    } catch (error: any) {
+      lastError = error;
+      
+      // Don't retry on certain errors
+      if (error.name === 'AbortError') {
+        throw new Error("Request timed out. Please try again.");
+      }
+      
+      if (error.message.includes("Server is overloaded") || 
+          error.message.includes("Rate limited") ||
+          error.message.includes("Service temporarily unavailable")) {
+        if (attempt < RATE_LIMIT.maxRetries) {
+          const delay = RATE_LIMIT.retryDelay * Math.pow(2, attempt); // Exponential backoff
+          console.log(`Retrying request in ${delay}ms (attempt ${attempt + 1}/${RATE_LIMIT.maxRetries + 1})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          continue;
+        }
+      }
+      
+      // For other errors, don't retry
+      break;
     }
-  });
-
-  if (!response.ok) {
-    throw new Error(`API request failed: ${response.status} ${response.statusText}`);
   }
-
-  return response.json();
+  
+  throw lastError || new Error("Request failed after all retry attempts");
 }
 
 export function registerUtilityTools(server: McpServer) {
@@ -944,7 +1029,7 @@ server.tool(
 // Search Customer Address Tool
 server.tool(
   "searchCustomerAddress",
-  "Get customer address information by customer ID with optional address company and address ID filters",
+  "Get customer address information by customer ID for business use only. This tool is intended for internal company use and returns business addresses, not personal/private addresses. Use this to retrieve the registered or primary business address for a customer, and all other addresses as well.",
   {
     customer_id: z.string().describe("Customer ID to get address information for"),
     address_company_id: z.string().optional().describe("Address company ID filter"),
@@ -962,11 +1047,46 @@ server.tool(
         return { content: [{ type: "text", text: `Error fetching customer address: ${data.message}` }] };
       }
 
+      // Normalize address data
+      const addresses = Array.isArray(data.result || data.data) ? (data.result || data.data) : [data.result || data.data || data];
+      let registered = null;
+      const others = [];
+      for (const addr of addresses) {
+        if (
+          (addr.address_name && addr.address_name.toLowerCase().includes('registered')) &&
+          !registered
+        ) {
+          registered = addr;
+        } else {
+          others.push(addr);
+        }
+      }
+
+      let text = '';
+      if (registered) {
+        text += `🏢 **Registered Address:**\n${registered.house_no || ''}\n${registered.city || ''}, ${registered.state || ''} ${registered.zip || ''}\n${registered.country || ''}\n`;
+        if (registered.address_name && registered.address_name !== 'Registered Address') {
+          text += `(Type: ${registered.address_name})\n`;
+        }
+        text += '\n';
+      }
+      if (others.length > 0) {
+        text += `📍 **Other Addresses:**\n`;
+        for (const addr of others) {
+          text += `- ${addr.house_no || ''}, ${addr.city || ''}, ${addr.state || ''} ${addr.zip || ''}, ${addr.country || ''}`;
+          if (addr.address_name) text += ` (Type: ${addr.address_name})`;
+          text += '\n';
+        }
+      }
+      if (!text) {
+        text = 'No address information found for this customer.';
+      }
+
       return {
         content: [
           {
             type: "text",
-            text: `Customer address information for ID "${customer_id}":\n\n${JSON.stringify(data.result || data.data || data, null, 2)}\n\n📋 Omit address_id to get primary/register address for this customer.`,
+            text,
           },
         ],
       };
