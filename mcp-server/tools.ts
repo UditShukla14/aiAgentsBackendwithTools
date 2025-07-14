@@ -873,13 +873,19 @@ server.tool(
       }
 
       const customers = data.result || data.data || [];
+      // Ensure each customer object has id and customer_name at the top level
+      const normalizedCustomers = customers.map((customer: any) => ({
+        id: customer.customer_id || customer.id,
+        customer_name: customer.customer_name || customer.name,
+        ...customer
+      }));
       
       // If search term is provided, try to find exact matches first
-      if (search && customers.length > 1) {
+      if (search && normalizedCustomers.length > 1) {
         const searchLower = search.toLowerCase().trim();
         
         // Look for exact name matches first
-        const exactNameMatches = customers.filter((customer: any) => {
+        const exactNameMatches = normalizedCustomers.filter((customer: any) => {
           const customerName = (customer.customer_name || customer.name || '').toLowerCase();
           const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
           return customerName === searchLower || companyName === searchLower;
@@ -890,14 +896,14 @@ server.tool(
             content: [
               {
                 type: "text",
-                text: `Found exact match for "${search}":\n\n${JSON.stringify(exactNameMatches[0], null, 2)}`,
+                text: JSON.stringify({ result: exactNameMatches[0] })
               },
             ],
           };
         }
         
         // If no exact match, look for partial name matches
-        const partialNameMatches = customers.filter((customer: any) => {
+        const partialNameMatches = normalizedCustomers.filter((customer: any) => {
           const customerName = (customer.customer_name || customer.name || '').toLowerCase();
           const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
           return customerName.includes(searchLower) || companyName.includes(searchLower);
@@ -908,7 +914,7 @@ server.tool(
             content: [
               {
                 type: "text",
-                text: `Found 1 customer matching "${search}":\n\n${JSON.stringify(partialNameMatches[0], null, 2)}`,
+                text: JSON.stringify({ result: partialNameMatches[0] })
               },
             ],
           };
@@ -920,7 +926,7 @@ server.tool(
             content: [
               {
                 type: "text",
-                text: `Found ${partialNameMatches.length} customers matching "${search}":\n\n${JSON.stringify(partialNameMatches, null, 2)}\n\n💡 For more precise results, try searching with the full name or use a more specific search term.`,
+                text: JSON.stringify({ result: partialNameMatches })
               },
             ],
           };
@@ -931,7 +937,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: `Found ${customers.length} customers:\n\n${JSON.stringify(customers, null, 2)}\n\n📋 Use search parameter to filter customers by name, email, phone, or company.`,
+            text: JSON.stringify({ result: normalizedCustomers })
           },
         ],
       };
@@ -1071,7 +1077,7 @@ ${lines}`;
         content: [
           {
             type: "text",
-            text: `[DISPLAY_VERBATIM] Customer address information:\n\n${formatted}`,
+            text: `[DISPLAY_VERBATIM]${formatted}`,
           },
         ],
       };
