@@ -27,6 +27,9 @@ interface ConversationContext {
     productId?: string;
     productName?: string;
     lastUpdated: number;
+    // Add these for address confirmation flow
+    awaitingAddressConfirmation?: boolean;
+    awaitingAddressCustomerId?: string;
   };
   userPreferences: Record<string, any>;
   lastActivity: number;
@@ -308,34 +311,75 @@ export class ContextManager {
   private updateActiveEntities(context: ConversationContext, toolName: string, result: any): void {
     try {
       const content = result.content?.[0]?.text;
+      console.log('updateActiveEntities toolName:', toolName);
+      console.log('updateActiveEntities raw result:', JSON.stringify(result));
+      console.log('updateActiveEntities content:', content);
       if (!content) return;
 
-      const data = JSON.parse(content);
-      const resultData = data.result;
-
-      // Update based on tool type
-      if (toolName.includes('Customer') && resultData) {
-        if (Array.isArray(resultData) && resultData.length > 0) {
-          const latest = resultData[resultData.length - 1];
-          context.activeEntities.customerId = latest.id?.toString();
-          context.activeEntities.customerName = latest.customer_name || latest.name;
-        } else if (resultData.id) {
-          context.activeEntities.customerId = resultData.id.toString();
-          context.activeEntities.customerName = resultData.customer_name || resultData.name;
+      let data: any = null;
+      try {
+        // Try to extract JSON object from the string
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          data = JSON.parse(jsonMatch[0]);
+          console.log('updateActiveEntities extracted JSON:', data);
+        } else {
+          data = null;
+          console.log('updateActiveEntities: no JSON object found in content');
         }
-        context.activeEntities.lastUpdated = Date.now();
+      } catch (e) {
+        data = null;
+        console.log('updateActiveEntities: failed to parse extracted JSON');
       }
 
-      if (toolName.includes('Product') && resultData) {
-        if (Array.isArray(resultData) && resultData.length > 0) {
-          const latest = resultData[resultData.length - 1];
-          context.activeEntities.productId = latest.id?.toString();
-          context.activeEntities.productName = latest.product_name || latest.name;
-        } else if (resultData.id) {
-          context.activeEntities.productId = resultData.id.toString();
-          context.activeEntities.productName = resultData.product_name || resultData.name;
-        }
+      if (data && (toolName.includes('Customer') || toolName.includes('customer'))) {
+        context.activeEntities.customerId = data.id?.toString() || data.customer_id?.toString();
+        context.activeEntities.customerName = data.name || data.customer_name;
         context.activeEntities.lastUpdated = Date.now();
+        console.log('updateActiveEntities: set customerId and customerName:', context.activeEntities.customerId, context.activeEntities.customerName);
+      }
+      // If data is parsed and has result, update as before
+      if (data && data.result) {
+        const resultData = data.result;
+        if (toolName.includes('Customer') && resultData) {
+          if (Array.isArray(resultData) && resultData.length > 0) {
+            const latest = resultData[resultData.length - 1];
+            context.activeEntities.customerId = latest.id?.toString();
+            context.activeEntities.customerName = latest.customer_name || latest.name;
+          } else if (resultData.id) {
+            context.activeEntities.customerId = resultData.id.toString();
+            context.activeEntities.customerName = resultData.customer_name || resultData.name;
+          }
+          context.activeEntities.lastUpdated = Date.now();
+        }
+        if (toolName.includes('Product') && resultData) {
+          if (Array.isArray(resultData) && resultData.length > 0) {
+            const latest = resultData[resultData.length - 1];
+            context.activeEntities.productId = latest.id?.toString();
+            context.activeEntities.productName = latest.product_name || latest.name;
+          } else if (resultData.id) {
+            context.activeEntities.productId = resultData.id.toString();
+            context.activeEntities.productName = resultData.product_name || resultData.name;
+          }
+          context.activeEntities.lastUpdated = Date.now();
+        }
+      } else if (/customer/i.test(toolName) && /customer/i.test(content)) {
+        // Try to match: ...: Customer Name. OR ...- Customer Name.
+        let match = content.match(/[:\-]\s*([A-Za-z0-9 .,&'-]+)\./);
+        if (!match) {
+          // Try to match: ...: Customer Name (end of string)
+          match = content.match(/[:\-]\s*([A-Za-z0-9 .,&'-]+)$/);
+        }
+        if (match) {
+          context.activeEntities.customerName = match[1].trim();
+          context.activeEntities.lastUpdated = Date.now();
+        }
+        // Try to extract customer ID if present (e.g., 'Customer ID: 600005804')
+        const idMatch = content.match(/customer id[:\-]?\s*(\d+)/i);
+        if (idMatch) {
+          context.activeEntities.customerId = idMatch[1];
+          context.activeEntities.lastUpdated = Date.now();
+        }
       }
     } catch (e) {
       // Ignore parsing errors
@@ -381,15 +425,19 @@ export class ContextManager {
     const enhancedArgs = { ...originalArgs };
     const hasReference = this.detectPronounReference(currentQuery);
 
-    // Always try to fill customer_id for any customer-related tool if pronoun is detected
     if (
       hasReference &&
       context.activeEntities.customerId &&
-      !enhancedArgs.customer_id &&
-      /customer|address|contact|details|info|find/i.test(toolName)
+      (!enhancedArgs.customer_id && !enhancedArgs.id) &&
+      /(customer|address|contact|details|info|find)/i.test(toolName)
     ) {
-      enhancedArgs.customer_id = context.activeEntities.customerId;
-      console.log(`🧠 Auto-filled customer_id: ${context.activeEntities.customerId} for tool: ${toolName}`);
+      // Try both possible argument names
+      if ('customer_id' in enhancedArgs || toolName.toLowerCase().includes('customer')) {
+        enhancedArgs.customer_id = context.activeEntities.customerId;
+      } else {
+        enhancedArgs.id = context.activeEntities.customerId;
+      }
+      console.log(`🧠 Auto-filled customer_id/id: ${context.activeEntities.customerId} for tool: ${toolName}`);
     }
 
     // Existing logic for other entities
@@ -438,7 +486,7 @@ export class ContextManager {
   }
 
   // Save context with compression
-  private async saveContext(sessionId: string, context: ConversationContext): Promise<void> {
+  public async saveContext(sessionId: string, context: ConversationContext): Promise<void> {
     // Remove old entity data if not recently used
     const entityAge = Date.now() - context.activeEntities.lastUpdated;
     if (entityAge > 10 * 60 * 1000) { // 10 minutes

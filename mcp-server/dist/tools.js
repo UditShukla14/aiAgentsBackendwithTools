@@ -733,11 +733,17 @@ export function registerBusinessTools(server) {
                 return { content: [{ type: "text", text: `Error fetching customers: ${data.message}` }] };
             }
             const customers = data.result || data.data || [];
+            // Ensure each customer object has id and customer_name at the top level
+            const normalizedCustomers = customers.map((customer) => ({
+                id: customer.customer_id || customer.id,
+                customer_name: customer.customer_name || customer.name,
+                ...customer
+            }));
             // If search term is provided, try to find exact matches first
-            if (search && customers.length > 1) {
+            if (search && normalizedCustomers.length > 1) {
                 const searchLower = search.toLowerCase().trim();
                 // Look for exact name matches first
-                const exactNameMatches = customers.filter((customer) => {
+                const exactNameMatches = normalizedCustomers.filter((customer) => {
                     const customerName = (customer.customer_name || customer.name || '').toLowerCase();
                     const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
                     return customerName === searchLower || companyName === searchLower;
@@ -747,13 +753,13 @@ export function registerBusinessTools(server) {
                         content: [
                             {
                                 type: "text",
-                                text: `Found exact match for "${search}":\n\n${JSON.stringify(exactNameMatches[0], null, 2)}`,
+                                text: JSON.stringify({ result: exactNameMatches[0] })
                             },
                         ],
                     };
                 }
                 // If no exact match, look for partial name matches
-                const partialNameMatches = customers.filter((customer) => {
+                const partialNameMatches = normalizedCustomers.filter((customer) => {
                     const customerName = (customer.customer_name || customer.name || '').toLowerCase();
                     const companyName = (customer.company_name || customer.business_name || '').toLowerCase();
                     return customerName.includes(searchLower) || companyName.includes(searchLower);
@@ -763,7 +769,7 @@ export function registerBusinessTools(server) {
                         content: [
                             {
                                 type: "text",
-                                text: `Found 1 customer matching "${search}":\n\n${JSON.stringify(partialNameMatches[0], null, 2)}`,
+                                text: JSON.stringify({ result: partialNameMatches[0] })
                             },
                         ],
                     };
@@ -774,7 +780,7 @@ export function registerBusinessTools(server) {
                         content: [
                             {
                                 type: "text",
-                                text: `Found ${partialNameMatches.length} customers matching "${search}":\n\n${JSON.stringify(partialNameMatches, null, 2)}\n\n💡 For more precise results, try searching with the full name or use a more specific search term.`,
+                                text: JSON.stringify({ result: partialNameMatches })
                             },
                         ],
                     };
@@ -784,7 +790,7 @@ export function registerBusinessTools(server) {
                 content: [
                     {
                         type: "text",
-                        text: `Found ${customers.length} customers:\n\n${JSON.stringify(customers, null, 2)}\n\n📋 Use search parameter to filter customers by name, email, phone, or company.`,
+                        text: JSON.stringify({ result: normalizedCustomers })
                     },
                 ],
             };
@@ -816,18 +822,12 @@ export function registerBusinessTools(server) {
             });
             if (exactMatches.length === 1) {
                 return {
-                    content: [{
-                            type: "text",
-                            text: `Found exact match for "${customer_name}":\n\n${JSON.stringify(exactMatches[0], null, 2)}`
-                        }]
+                    content: [{ type: "text", text: JSON.stringify({ result: exactMatches[0] }) }]
                 };
             }
             if (exactMatches.length > 1) {
                 return {
-                    content: [{
-                            type: "text",
-                            text: `Found ${exactMatches.length} customers with exact name "${customer_name}":\n\n${JSON.stringify(exactMatches, null, 2)}\n\n💡 Please provide more specific information to identify the correct customer.`
-                        }]
+                    content: [{ type: "text", text: JSON.stringify({ result: exactMatches }) }]
                 };
             }
             // If no exact match, look for partial matches
@@ -838,25 +838,16 @@ export function registerBusinessTools(server) {
             });
             if (partialMatches.length === 0) {
                 return {
-                    content: [{
-                            type: "text",
-                            text: `No customers found matching "${customer_name}". Please check the spelling or try a different search term.`
-                        }]
+                    content: [{ type: "text", text: `No customers found matching "${customer_name}".` }]
                 };
             }
             if (partialMatches.length === 1) {
                 return {
-                    content: [{
-                            type: "text",
-                            text: `Found 1 customer matching "${customer_name}":\n\n${JSON.stringify(partialMatches[0], null, 2)}`
-                        }]
+                    content: [{ type: "text", text: JSON.stringify({ result: partialMatches[0] }) }]
                 };
             }
             return {
-                content: [{
-                        type: "text",
-                        text: `Found ${partialMatches.length} customers matching "${customer_name}":\n\n${JSON.stringify(partialMatches, null, 2)}\n\n💡 For more precise results, try searching with the full name.`
-                    }]
+                content: [{ type: "text", text: JSON.stringify({ result: partialMatches }) }]
             };
         }
         catch (error) {
@@ -864,7 +855,7 @@ export function registerBusinessTools(server) {
         }
     });
     // Search Customer Address Tool
-    server.tool("searchCustomerAddress", "Get customer address information by customer ID for business use only. This tool is intended for internal company use and returns business addresses, not personal/private addresses. Use this to retrieve the registered or primary business address for a customer, and all other addresses as well.", {
+    server.tool("searchCustomerAddress", "Get customer address information by customer ID with optional address company and address ID filters", {
         customer_id: z.string().describe("Customer ID to get address information for"),
         address_company_id: z.string().optional().describe("Address company ID filter"),
         address_id: z.string().optional().describe("Specific address ID (remove to get primary/register address for customer)"),
@@ -878,44 +869,29 @@ export function registerBusinessTools(server) {
             if (!data.success) {
                 return { content: [{ type: "text", text: `Error fetching customer address: ${data.message}` }] };
             }
-            // Normalize address data
-            const addresses = Array.isArray(data.result || data.data) ? (data.result || data.data) : [data.result || data.data || data];
-            let registered = null;
-            const others = [];
-            for (const addr of addresses) {
-                if ((addr.address_name && addr.address_name.toLowerCase().includes('registered')) &&
-                    !registered) {
-                    registered = addr;
-                }
-                else {
-                    others.push(addr);
-                }
+            const addresses = data.result || data.data || [];
+            if (!Array.isArray(addresses) || addresses.length === 0) {
+                return { content: [{ type: "text", text: `No addresses found for customer ID "${customer_id}".` }] };
             }
-            let text = '';
-            if (registered) {
-                text += `🏢 **Registered Address:**\n${registered.house_no || ''}\n${registered.city || ''}, ${registered.state || ''} ${registered.zip || ''}\n${registered.country || ''}\n`;
-                if (registered.address_name && registered.address_name !== 'Registered Address') {
-                    text += `(Type: ${registered.address_name})\n`;
-                }
-                text += '\n';
-            }
-            if (others.length > 0) {
-                text += `📍 **Other Addresses:**\n`;
-                for (const addr of others) {
-                    text += `- ${addr.house_no || ''}, ${addr.city || ''}, ${addr.state || ''} ${addr.zip || ''}, ${addr.country || ''}`;
-                    if (addr.address_name)
-                        text += ` (Type: ${addr.address_name})`;
-                    text += '\n';
-                }
-            }
-            if (!text) {
-                text = 'No address information found for this customer.';
-            }
+            // Format each address in a readable way
+            const formatted = addresses.map((addr, i) => {
+                const label = addr.address_type_name || addr.type || (i === 0 ? "Registered/Primary Address" : `Service Address ${i}`);
+                const lines = [
+                    addr.house_no,
+                    addr.landmark,
+                    addr.city,
+                    addr.state,
+                    addr.zip,
+                    addr.country
+                ].filter(Boolean).join(", ");
+                return `${label}:
+${lines}`;
+            }).join("\n\n");
             return {
                 content: [
                     {
                         type: "text",
-                        text,
+                        text: `[DISPLAY_VERBATIM]${formatted}`,
                     },
                 ],
             };

@@ -978,19 +978,13 @@ server.tool(
       
       if (exactMatches.length === 1) {
         return {
-          content: [{
-            type: "text",
-            text: `Found exact match for "${customer_name}":\n\n${JSON.stringify(exactMatches[0], null, 2)}`
-          }]
+          content: [{ type: "text", text: JSON.stringify({ result: exactMatches[0] }) }]
         };
       }
       
       if (exactMatches.length > 1) {
         return {
-          content: [{
-            type: "text",
-            text: `Found ${exactMatches.length} customers with exact name "${customer_name}":\n\n${JSON.stringify(exactMatches, null, 2)}\n\n💡 Please provide more specific information to identify the correct customer.`
-          }]
+          content: [{ type: "text", text: JSON.stringify({ result: exactMatches }) }]
         };
       }
       
@@ -1003,27 +997,18 @@ server.tool(
       
       if (partialMatches.length === 0) {
         return {
-          content: [{
-            type: "text",
-            text: `No customers found matching "${customer_name}". Please check the spelling or try a different search term.`
-          }]
+          content: [{ type: "text", text: `No customers found matching "${customer_name}".` }]
         };
       }
       
       if (partialMatches.length === 1) {
         return {
-          content: [{
-            type: "text",
-            text: `Found 1 customer matching "${customer_name}":\n\n${JSON.stringify(partialMatches[0], null, 2)}`
-          }]
+          content: [{ type: "text", text: JSON.stringify({ result: partialMatches[0] }) }]
         };
       }
       
       return {
-        content: [{
-          type: "text",
-          text: `Found ${partialMatches.length} customers matching "${customer_name}":\n\n${JSON.stringify(partialMatches, null, 2)}\n\n💡 For more precise results, try searching with the full name.`
-        }]
+        content: [{ type: "text", text: JSON.stringify({ result: partialMatches }) }]
       };
 
     } catch (error: any) {

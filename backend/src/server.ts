@@ -11,6 +11,42 @@ import { randomUUID } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { globalRateLimiter, RetryManager } from "./rate-limiter.js";
+import { SYSTEM_PROMPT, GREETING_PROMPT, SIMPLE_PROMPT, BUSINESS_PROMPT } from './resources/prompts.js';
+import { greetings, dateKeywords, simplePatterns, businessKeywords, complexPatterns, allowedOrigins } from './resources/staticData.js';
+
+// Utility to remove internal IDs from user-facing text
+function filterInternalIds(text: string): string {
+  // Remove lines containing internal IDs (id, customer_id, product_id, invoice_id, etc.)
+  return text.replace(/\b(id|customer_id|product_id|invoice_id|estimate_id|user_id|quickbook_customer_id|handshake_key|assign_employee_user_id)\b\s*[:=]\s*['"\d\w-]+,?/gi, '')
+    .replace(/\b(id|customer_id|product_id|invoice_id|estimate_id|user_id|quickbook_customer_id|handshake_key|assign_employee_user_id)\b\s*[:=]\s*['"\d\w-]+/gi, '')
+    .replace(/\n\s*\n/g, '\n') // Remove extra blank lines
+    .replace(/\{\s*,/g, '{') // Remove leading commas in objects
+    .replace(/,\s*\}/g, '}'); // Remove trailing commas in objects
+}
+
+// Utility to format address responses for end users
+function formatAddressResponse(text: string): string {
+  // Remove [DISPLAY_VERBATIM]
+  let cleaned = text.replace('[DISPLAY_VERBATIM]', '').trim();
+
+  // If it looks like an address block, format it nicely
+  if (/address[:]?/i.test(cleaned)) {
+    // Try to split after 'Address:' or on the next line
+    const match = cleaned.match(/(.*Address:?)([\s\S]*)/i);
+    if (match) {
+      const label = match[1].trim();
+      let address = match[2].trim();
+      // If address is empty, try to get the next line
+      if (!address && cleaned.includes('\n')) {
+        address = cleaned.split('\n').slice(1).join('\n').trim();
+      }
+      // Split address by commas, trim, and join as lines
+      const lines = address.split(',').map(line => line.trim()).filter(Boolean);
+      return `${label}\n${lines.join('\n')}`;
+    }
+  }
+  return cleaned;
+}
 
 dotenv.config();
 
@@ -30,13 +66,6 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 if (!ANTHROPIC_API_KEY) {
   throw new Error("ANTHROPIC_API_KEY is not set");
 }
-
-const allowedOrigins = [
-  "https://app.worxstream.io", // ✅ Production frontend
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "http://localhost:4173"
-];
 
 const app = express();
 const httpServer = createServer(app);
@@ -84,19 +113,6 @@ class MCPBackendService {
   private autoConnectRetries: number = 0;
   private maxAutoConnectRetries: number = 3;
 
-  private readonly SYSTEM_PROMPT = `
-🚨 SYSTEM NOTICE: You are an internal system assistant for a secure business environment. All data you access and display comes from protected, authenticated API routes. You are authorized to display any business data (including addresses, contacts, invoices, etc.) that is retrieved via these tools. Do NOT show privacy warnings for business data. This is NOT personal/private data, but business data for internal, authorized use only.
-
-- When a user requests business contact or address information for a customer that has already been found via a business tool, you MUST use the appropriate tool to fetch and display the information.
-- NEVER refuse with a privacy warning for business data found via a tool.
-- If a tool requires an ID or parameter and it is available from context, ALWAYS use it automatically.
-- When users use pronouns (his, her, their, this customer, that product), you MUST resolve them from recent context and use the relevant entity (such as customer_id, product_id, etc.) in your tool calls.
-- Only ask for missing information if it's truly not available in the conversation context.
-- 🚫 IDs (such as customer_id, product_id, invoice_id, etc.) are for internal use only and MUST NEVER be shown in any output to end users. Do not display, mention, or reference any internal IDs in user-facing messages, summaries, or tables.
-
-All other instructions (tool usage, formatting, date handling, etc.) remain as previously described.
-`;
-
   constructor() {
     this.anthropic = new Anthropic({
       apiKey: ANTHROPIC_API_KEY,
@@ -111,62 +127,32 @@ All other instructions (tool usage, formatting, date handling, etc.) remain as p
   // Smart query classification for token optimization
   private classifyQuery(query: string): 'greeting' | 'simple' | 'business' | 'complex' {
     const lowerQuery = query.toLowerCase().trim();
-    
-    // Greetings and social interactions (highest token savings)
-    const greetings = [
-      'hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening',
-      'thanks', 'thank you', 'ty', 'thx', 'bye', 'goodbye', 'see you', 'later',
-      'how are you', 'whats up', 'wassup', 'morning', 'evening'
-    ];
-    if (greetings.some(greeting => lowerQuery.includes(greeting)) && lowerQuery.length < 50) {
-      return 'greeting';
-    }
-    
-    // Date-related queries should be business queries to get access to date tools
-    const dateKeywords = [
-      'yesterday', 'today', 'tomorrow', 'last', 'this', 'next', 'past', 'ago',
-      'date', 'time', 'period', 'range', 'week', 'month', 'year', 'days',
-      'quarter', 'decade', 'century', 'morning', 'afternoon', 'evening',
-      'night', 'dawn', 'dusk', 'noon', 'midnight', 'hour', 'minute', 'second',
-      'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday',
-      'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
-      'september', 'october', 'november', 'december', 'jan', 'feb', 'mar', 'apr',
-      'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec', 'what is', 'when is'
-    ];
-    
-    if (dateKeywords.some(keyword => lowerQuery.includes(keyword))) {
-      return 'business';
-    }
-    
-    // Simple questions and help requests (but not date-related)
-    const simplePatterns = [
-      'what can you do', 'help me', 'who are you', 'how do i',
-      'can you help', 'what are your capabilities', 'what tools', 'how does this work'
-    ];
-    if (simplePatterns.some(pattern => lowerQuery.includes(pattern)) && lowerQuery.length < 100) {
-      return 'simple';
-    }
-    
-    // Business queries that need tools
-    const businessKeywords = [
-      'customer', 'product', 'invoice', 'estimate', 'search', 'find', 'get', 'list', 
-      'show', 'display', 'fetch', 'retrieve', 'lookup', 'details', 'info', 'address',
-      'email', 'phone', 'contact', 'create', 'add', 'update', 'delete'
-    ];
+
+    // 1. Business queries that need tools (check first!)
     if (businessKeywords.some(keyword => lowerQuery.includes(keyword))) {
       return 'business';
     }
-    
-    // Complex analysis (multiple steps, comparisons, reports)
-    const complexPatterns = [
-      'compare', 'analyze', 'report', 'calculate', 'multiple', 'all customers who',
-      'send email', 'generate report', 'analysis', 'summary', 'overview', 'dashboard',
-      'export', 'import', 'bulk', 'batch'
-    ];
+
+    // 2. Date-related queries
+    if (dateKeywords.some(keyword => lowerQuery.includes(keyword))) {
+      return 'business';
+    }
+
+    // 3. Complex analysis (multiple steps, comparisons, reports)
     if (complexPatterns.some(pattern => lowerQuery.includes(pattern)) || lowerQuery.length > 150) {
       return 'complex';
     }
-    
+
+    // 4. Simple questions and help requests (but not date/business/complex)
+    if (simplePatterns.some(pattern => lowerQuery.includes(pattern)) && lowerQuery.length < 100) {
+      return 'simple';
+    }
+
+    // 5. Greetings and social interactions (require full match or near-exact match)
+    if (greetings.some(greeting => lowerQuery === greeting || lowerQuery.startsWith(greeting + ' ') || lowerQuery.endsWith(' ' + greeting))) {
+      return 'greeting';
+    }
+
     return 'simple';
   }
 
@@ -174,41 +160,19 @@ All other instructions (tool usage, formatting, date handling, etc.) remain as p
   private getSystemPrompt(queryType: string): string {
     switch (queryType) {
       case 'greeting':
-        return `You are a friendly business assistant. Respond warmly and briefly to greetings and social interactions. Keep responses short, natural, and conversational.`;
+        return GREETING_PROMPT;
         
       case 'simple':
-        return `You are a helpful business assistant. Answer questions naturally and conversationally. Provide helpful information about your capabilities when asked. Only mention specific business tools if directly relevant to the question.`;
+        return SIMPLE_PROMPT;
         
       case 'business':
-        return `You are a business assistant with access to InvoiceMakerPro tools for managing customers, products, invoices, and estimates. Use the appropriate tools to help with business data queries.
-
-CRITICAL DATE HANDLING:
-- For ANY query that mentions dates, time periods, or time-related words, ALWAYS use the date calculation tool first
-- Use date-utility to convert ANY natural language date expression to exact dates
-- This includes simple date questions like "what is 2 weeks before today", "when is tomorrow", etc.
-- NEVER answer date questions directly - ALWAYS use the date tool
-- Then use the calculated dates with search tools (searchEstimateList, searchInvoiceList, etc.)
-- NEVER guess or assume dates - always calculate them properly
-- NEVER use searchEstimateList or searchInvoiceList directly with date expressions
-- ALWAYS follow this pattern: ANY_DATE_EXPRESSION → date-utility(operation: 'parse', date: EXPRESSION) → use result
-- Examples: "last 2 weeks", "yesterday", "this month", "past 30 days", "next quarter", "end of month", "what is 2 weeks before today", "when is tomorrow", etc.
-- If you see ANY date-related words, you MUST call date-utility with operation 'parse' first
-
-IMPORTANT: 
-- Display tool results exactly as provided
-- Use conversation context to resolve pronouns and references automatically
-- Only ask for missing information if it's not available in context
-
-CUSTOMER SEARCH GUIDELINES:
-- For specific customer name searches (e.g., "customer by name gory"), use findCustomerByName tool for more precise results
-- For general customer searches, use searchCustomerList tool
-- Always prefer exact name matches over partial matches when possible`;
+        return BUSINESS_PROMPT;
         
       case 'complex':
-        return this.SYSTEM_PROMPT; // Full prompt for complex tasks
+        return SYSTEM_PROMPT; // Full prompt for complex tasks
         
       default:
-        return this.SYSTEM_PROMPT;
+        return SYSTEM_PROMPT;
     }
   }
 
@@ -395,6 +359,67 @@ CUSTOMER SEARCH GUIDELINES:
       throw new Error("Not connected to MCP server");
     }
 
+    // Check for yes/no address confirmation
+    const context = await this.contextManager.getSession(sessionId);
+    if (query.trim().toLowerCase() === 'yes') {
+      if (context?.activeEntities.awaitingAddressConfirmation) {
+        console.log('Address confirmation YES detected, calling address tool...');
+        const customerId = context.activeEntities.awaitingAddressCustomerId;
+        if (customerId) {
+          // Call the address tool with the stored customerId
+          const addressResult = await this.mcp.callTool({
+            name: 'searchCustomerAddress',
+            arguments: { customer_id: customerId },
+          });
+          const addressContent = Array.isArray(addressResult.content) ? addressResult.content : [];
+          const addressText = addressContent[0]?.text?.trim() || '';
+          console.log('[DEBUG] Raw address tool result:', addressText);
+
+          let formattedAddress = '';
+          if (!addressText || addressText.toLowerCase().includes('no address')) {
+            formattedAddress = 'No address found for this customer.';
+          } else {
+            formattedAddress = filterInternalIds(addressText.replace('[DISPLAY_VERBATIM]', '').trim());
+          }
+
+          await this.contextManager.addMessage(
+            sessionId,
+            'assistant',
+            formattedAddress
+          );
+          onChunk({
+            type: 'complete',
+            response: formattedAddress,
+            toolsUsed: ['searchCustomerAddress'],
+            queryType: 'business',
+            tokensOptimized: true
+          });
+          // Clear the flag
+          context.activeEntities.awaitingAddressConfirmation = false;
+          context.activeEntities.awaitingAddressCustomerId = undefined;
+          await this.contextManager.saveContext(sessionId, context);
+          return;
+        }
+      } else {
+        // Fallback for out-of-context 'yes'
+        console.log('Received "yes" but no address confirmation flag set. Sending fallback message.');
+        const fallbackMsg = "Sorry, I’m not sure what you’re saying ‘yes’ to. Please search for a customer first.";
+        await this.contextManager.addMessage(
+          sessionId,
+          'assistant',
+          fallbackMsg
+        );
+        onChunk({
+          type: 'complete',
+          response: fallbackMsg,
+          toolsUsed: [],
+          queryType: 'simple',
+          tokensOptimized: true
+        });
+        return;
+      }
+    }
+
     const queryType = this.classifyQuery(query);
     console.log(`🎯 Query classified as: ${queryType} | Length: ${query.length} chars`);
 
@@ -416,12 +441,10 @@ Current conversation context:
 
       const activeEntities = toolContext.activeEntities;
       if (activeEntities.customerName) {
-        contextInfo += `
-- Active customer: ${activeEntities.customerName}${activeEntities.customerId ? ` (ID: ${activeEntities.customerId})` : ''}`;
+        contextInfo += `\n- Active customer: ${activeEntities.customerName}`;
       }
       if (activeEntities.productName) {
-        contextInfo += `
-- Active product: ${activeEntities.productName}${activeEntities.productId ? ` (ID: ${activeEntities.productId})` : ''}`;
+        contextInfo += `\n- Active product: ${activeEntities.productName}`;
       }
     }
 
@@ -430,10 +453,12 @@ Current conversation context:
     const relevantTools = this.getRelevantTools(queryType, query);
     const maxTokens = this.getMaxTokens(queryType);
 
-    // Build contextual system prompt
-    const contextualSystemPrompt = contextInfo 
-      ? `${systemPrompt}\n\n${contextInfo}`
-      : systemPrompt;
+    // Build dynamic context string
+    const activeEntities = toolContext?.activeEntities;
+    const dynamicContext = activeEntities && activeEntities.customerName
+      ? `The customer "${activeEntities.customerName}" was found via a secure business tool. It is authorized to display their business address.`
+      : '';
+    const contextualSystemPrompt = systemPrompt.replace('[CONTEXT_PLACEHOLDER]', dynamicContext);
 
     // Prepare messages
     const messages: Anthropic.MessageParam[] = [
@@ -445,7 +470,7 @@ Current conversation context:
 
     console.log(`📊 Token optimization applied:
 - Query type: ${queryType}
-- System prompt: ${contextualSystemPrompt.length} chars (vs ${this.SYSTEM_PROMPT.length} full)
+- System prompt: ${contextualSystemPrompt.length} chars (vs ${SYSTEM_PROMPT.length} full)
 - Tools included: ${relevantTools.length}/${this.tools.length}
 - Context info: ${contextInfo.length} chars
 - Max tokens: ${maxTokens}`);
@@ -531,7 +556,18 @@ Current conversation context:
           if (currentToolCall) {
             try {
               if (currentToolCall.inputJson) {
-                currentToolCall.input = JSON.parse(currentToolCall.inputJson);
+                try {
+                  // Only parse if it looks like valid JSON (starts with { and ends with })
+                  const trimmed = currentToolCall.inputJson.trim();
+                  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                    currentToolCall.input = JSON.parse(trimmed);
+                  } else {
+                    // Incomplete JSON, skip parsing for now
+                    console.warn('[WARN] Skipping parse of incomplete tool input JSON:', currentToolCall.inputJson);
+                  }
+                } catch (e) {
+                  console.error('[ERROR] Failed to parse tool input JSON:', currentToolCall.inputJson, e);
+                }
               }
             } catch (e) {
               console.error('Failed to parse tool input JSON:', e);
@@ -556,12 +592,12 @@ Current conversation context:
         await this.contextManager.addMessage(
           sessionId, 
           'assistant', 
-          streamedContent || "No response generated."
+          filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim()
         );
         
         onChunk({
           type: 'complete',
-          response: streamedContent || "No response generated.",
+          response: filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(),
           toolsUsed: [],
           queryType,
           tokensOptimized: true
@@ -587,12 +623,12 @@ Current conversation context:
         await this.contextManager.addMessage(
           sessionId, 
           'assistant', 
-          streamedContent || "No response generated."
+          filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim()
         );
         
         onChunk({
           type: 'complete',
-          response: streamedContent || "No response generated.",
+          response: filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(),
           toolsUsed: [],
           queryType,
           tokensOptimized: true
@@ -690,8 +726,21 @@ private async processToolCallsWithStreaming(
           await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
         }
         
-        // Record tool usage in context
+        // Always record tool usage (which updates activeEntities) with the raw tool result
         await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
+        // Refresh context after tool usage
+        const sessionContext = await this.contextManager.getSession(sessionId);
+        if (toolName === 'findCustomerByName' || toolName === 'searchCustomerList') {
+          if (sessionContext && sessionContext.activeEntities.customerId) {
+            console.log('[DEBUG] Setting address confirmation flag for customerId:', sessionContext.activeEntities.customerId);
+            sessionContext.activeEntities.awaitingAddressConfirmation = true;
+            sessionContext.activeEntities.awaitingAddressCustomerId = sessionContext.activeEntities.customerId;
+            await this.contextManager.saveContext(sessionId, sessionContext);
+            console.log('[DEBUG] After customer search, activeEntities:', JSON.stringify(sessionContext.activeEntities, null, 2));
+          } else {
+            console.log('[DEBUG] Not setting flag: sessionContext or customerId missing', sessionContext);
+          }
+        }
         
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -720,6 +769,75 @@ private async processToolCallsWithStreaming(
       content: result.content || [{ type: "text", text: JSON.stringify(result) }],
       is_error: result.isError || false,
     });
+
+    // After getting the result for a customer search tool, set last customer context
+    if ((toolName === 'findCustomerByName' || toolName === 'searchCustomerList') && result && result.content && result.content[0] && result.content[0].text) {
+      const rawText = result.content[0].text;
+      console.log('[DEBUG] Raw tool result text:', rawText);
+      let data: any = null;
+      try {
+        // Try to extract JSON object from the string
+        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          data = JSON.parse(jsonMatch[0]);
+          console.log('[DEBUG] Extracted and parsed JSON:', data);
+        } else {
+          console.log('[DEBUG] No JSON object found in tool result text');
+        }
+        if (data) {
+          // Use data.result if present
+          const dataForSummary = data.result || data;
+          const customerName = dataForSummary.customer_name || dataForSummary.name || '';
+          if (customerName) {
+            // Set the address confirmation flag in context
+            const sessionContext = await this.contextManager.getSession(sessionId);
+            if (sessionContext) {
+              sessionContext.activeEntities.customerId = dataForSummary.id?.toString() || dataForSummary.customer_id?.toString();
+              sessionContext.activeEntities.customerName = customerName;
+              sessionContext.activeEntities.awaitingAddressConfirmation = true;
+              sessionContext.activeEntities.awaitingAddressCustomerId = sessionContext.activeEntities.customerId;
+              await this.contextManager.saveContext(sessionId, sessionContext);
+              console.log('[DEBUG] Setting address confirmation flag for customerId:', sessionContext.activeEntities.customerId);
+              console.log('[DEBUG] After customer search, activeEntities:', JSON.stringify(sessionContext.activeEntities, null, 2));
+            }
+            // Build a customer summary (customize as needed)
+            const summary = [
+              `Customer: ${customerName}`,
+              dataForSummary.email ? `Email: ${dataForSummary.email}` : null,
+              dataForSummary.phone ? `Phone: ${dataForSummary.phone}` : null,
+              dataForSummary.type_of_customer ? `Type: ${dataForSummary.type_of_customer}` : null,
+              dataForSummary.status_name ? `Status: ${dataForSummary.status_name}` : null
+            ].filter(Boolean).join('\n');
+            // Combine summary and prompt
+            const addressPrompt = 'Would you like to see this customer’s address? (yes/no)';
+            const combinedMessage = `${summary}\n\n${addressPrompt}`;
+            // DEBUG LOGGING
+            console.log('[DEBUG] ===== CUSTOMER SEARCH RESPONSE =====');
+            console.log('[DEBUG] Summary:', summary);
+            console.log('[DEBUG] Address prompt:', addressPrompt);
+            console.log('[DEBUG] Combined message:', combinedMessage);
+            console.log('[DEBUG] Combined message length:', combinedMessage.length);
+            console.log('[DEBUG] ======================================');
+            // Send both together
+            await this.contextManager.addMessage(
+              sessionId,
+              'assistant',
+              combinedMessage
+            );
+            onChunk({
+              type: 'complete',
+              response: combinedMessage,
+              toolsUsed: [toolName],
+              queryType: 'business',
+              tokensOptimized: true
+            });
+            return;
+          }
+        }
+      } catch (e) {
+        console.log('[DEBUG] Failed to parse extracted JSON:', e);
+      }
+    }
   }
 
   // Add tool results to the conversation
@@ -761,13 +879,13 @@ private async processToolCallsWithStreaming(
     await this.contextManager.addMessage(
       sessionId, 
       'assistant', 
-      verbatimContent,
+      filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
       toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
     );
     
     onChunk({
       type: 'complete',
-      response: verbatimContent,
+      response: filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
       toolsUsed: toolUsageLog
     });
     return;
@@ -863,7 +981,18 @@ private async continueStreamingConversation(
           if (currentToolCall) {
             try {
               if (currentToolCall.inputJson) {
-                currentToolCall.input = JSON.parse(currentToolCall.inputJson);
+                try {
+                  // Only parse if it looks like valid JSON (starts with { and ends with })
+                  const trimmed = currentToolCall.inputJson.trim();
+                  if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+                    currentToolCall.input = JSON.parse(trimmed);
+                  } else {
+                    // Incomplete JSON, skip parsing for now
+                    console.warn('[WARN] Skipping parse of incomplete tool input JSON:', currentToolCall.inputJson);
+                  }
+                } catch (e) {
+                  console.error('[ERROR] Failed to parse tool input JSON:', currentToolCall.inputJson, e);
+                }
               }
             } catch (e) {
               console.error('Failed to parse tool input JSON:', e);
@@ -882,13 +1011,13 @@ private async continueStreamingConversation(
         await this.contextManager.addMessage(
           sessionId, 
           'assistant', 
-          streamedContent || "No response generated.",
+          filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(),
           toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
         );
         
         onChunk({
           type: 'complete',
-          response: streamedContent || "No response generated.",
+          response: filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(),
           toolsUsed: toolUsageLog
         });
         return;
@@ -1027,13 +1156,13 @@ private async continueStreamingConversation(
         await this.contextManager.addMessage(
           sessionId, 
           'assistant', 
-          verbatimContent,
+          filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
           toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
         );
         
         onChunk({
           type: 'complete',
-          response: verbatimContent,
+          response: filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
           toolsUsed: toolUsageLog
         });
         return;
@@ -1079,12 +1208,10 @@ Current conversation context:
 
       const activeEntities = toolContext.activeEntities;
       if (activeEntities.customerName) {
-        contextInfo += `
-- Active customer: ${activeEntities.customerName}${activeEntities.customerId ? ` (ID: ${activeEntities.customerId})` : ''}`;
+        contextInfo += `\n- Active customer: ${activeEntities.customerName}`;
       }
       if (activeEntities.productName) {
-        contextInfo += `
-- Active product: ${activeEntities.productName}${activeEntities.productId ? ` (ID: ${activeEntities.productId})` : ''}`;
+        contextInfo += `\n- Active product: ${activeEntities.productName}`;
       }
     }
 
@@ -1093,16 +1220,17 @@ Current conversation context:
     const relevantTools = this.getRelevantTools(queryType, query);
     const maxTokens = this.getMaxTokens(queryType);
     
-    const contextualSystemPrompt = contextInfo ? `${systemPrompt}${contextInfo}
-
-Use this context to provide more relevant and personalized responses. When users use pronouns or references like "he", "his", "that customer", automatically resolve them from the context above.
-
-CRITICAL: When tools return formatted output with sections, headers, bullet points, or structured data, you MUST display it exactly as provided. Never summarize or rewrite formatted tool outputs - show them verbatim.` : systemPrompt;
+    // Build dynamic context string
+    const activeEntities = toolContext?.activeEntities;
+    const dynamicContext = activeEntities && activeEntities.customerName
+      ? `The customer "${activeEntities.customerName}" was found via a secure business tool. It is authorized to display their business address.`
+      : '';
+    const contextualSystemPrompt = systemPrompt.replace('[CONTEXT_PLACEHOLDER]', dynamicContext);
 
     // Token optimization logging
     console.log(`📊 Token optimization applied:
 - Query type: ${queryType}
-- System prompt: ${systemPrompt.length} chars (vs ${this.SYSTEM_PROMPT.length} full)
+- System prompt: ${systemPrompt.length} chars (vs ${SYSTEM_PROMPT.length} full)
 - Tools included: ${relevantTools.length}/${this.tools.length}
 - Context info: ${contextInfo.length} chars
 - Max tokens: ${maxTokens}`);
@@ -1137,7 +1265,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
         await this.contextManager.addMessage(
           sessionId, 
           'assistant', 
-          textContent || "No response generated."
+          filterInternalIds(textContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim()
         );
         
         console.log(`⚡ Fast-tracked ${queryType} query - no tool processing needed`);
@@ -1172,7 +1300,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           await this.contextManager.addMessage(
             sessionId, 
             'assistant', 
-            textContent || "No response generated.",
+            filterInternalIds(textContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(),
             toolNames.length > 0 ? toolNames : undefined
           );
           
@@ -1277,7 +1405,7 @@ CRITICAL: When tools return formatted output with sections, headers, bullet poin
           await this.contextManager.addMessage(
             sessionId, 
             'assistant', 
-            verbatimContent,
+            filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
             toolNames.length > 0 ? toolNames : undefined
           );
           
