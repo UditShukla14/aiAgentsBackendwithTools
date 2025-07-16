@@ -1,7 +1,7 @@
 // tools.ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { registerBusinessTools } from "./businessTools";
+import { registerBusinessTools } from "./businessTools.js";
 
 
 export function registerUtilityTools(server: McpServer) {
