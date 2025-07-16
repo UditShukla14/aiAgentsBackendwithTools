@@ -170,6 +170,10 @@ class MCPBackendService {
                     if (toolName === 'date-utility')
                         return true;
                 }
+                const keywords = ['delivery', 'delivery board', 'delivery schedule', 'delivery tracking', 'delivery planning', 'delivery logistics', 'delivery daily', 'delivery weekly', 'delivery monthly', 'delivery yearly', 'delivery board', 'delivery schedule', 'delivery tracking', 'delivery planning', 'delivery logistics', 'delivery daily', 'delivery weekly', 'delivery monthly', 'delivery yearly', 'deliveries'];
+                // Delivery board queries
+                if (keywords.some(keyword => lowerQuery.includes(keyword)) && toolName.includes('delivery'))
+                    return true;
                 // Customer-related queries
                 if ((lowerQuery.includes('customer') || lowerQuery.includes('client')) &&
                     toolName.includes('customer'))

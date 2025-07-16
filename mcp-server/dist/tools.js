@@ -1285,6 +1285,83 @@ ${lines}`;
             return { content: [{ type: "text", text: `Error: ${error.message}` }] };
         }
     });
+    // Delivery Schedule Tool
+    server.tool("getDeliverySchedule", "View the delivery board and delivery schedule for a company/user. Use this tool to track what needs to be delivered and when, including all scheduled deliveries, shipping, and delivery tracking. Filter by date range and board. Defaults to the current week if no date is provided. Useful for delivery board, delivery schedule, shipping, and delivery tracking.", {
+        from_date: z.string().optional().describe("Start date filter (YYYY-MM-DD format, defaults to current week start)"),
+        to_date: z.string().optional().describe("End date filter (YYYY-MM-DD format, defaults to current week end)"),
+        board_id: z.string().default("0").describe("Board ID (default: '0')"),
+    }, async ({ from_date, to_date, board_id }) => {
+        try {
+            // Helper to get current week start (Monday) and end (Sunday)
+            const getCurrentWeekRange = () => {
+                const now = new Date();
+                const day = now.getDay();
+                const diffToMonday = (day === 0 ? -6 : 1) - day; // Monday as first day
+                const monday = new Date(now);
+                monday.setDate(now.getDate() + diffToMonday);
+                const sunday = new Date(monday);
+                sunday.setDate(monday.getDate() + 6);
+                const toISO = (d) => d.toISOString().split('T')[0];
+                return { start: toISO(monday), end: toISO(sunday) };
+            };
+            const week = getCurrentWeekRange();
+            const cleanDate = (date, fallback) => {
+                if (!date)
+                    return fallback;
+                return date.trim();
+            };
+            const params = {
+                company_id: REQUIRED_FIELDS.company_id,
+                user_id: REQUIRED_FIELDS.user_id,
+                role: "company",
+                token: REQUIRED_FIELDS.token,
+                imp_session_id: REQUIRED_FIELDS.imp_session_id,
+                from_date: cleanDate(from_date, week.start),
+                to_date: cleanDate(to_date, week.end),
+                board_id: board_id || "0"
+            };
+            const data = await callIMPApi("/api/boards/get_event_list", params);
+            if (!data.success) {
+                return { content: [{ type: "text", text: `Error fetching delivery schedule: ${data.message}` }] };
+            }
+            const events = data.result || [];
+            const formatted = events.map((event) => ({
+                id: event.id,
+                type: event.type,
+                object_name: event.object_name,
+                object_id: event.object_id,
+                delivery_date: event.delivery_date,
+                job_name: event.job_name,
+                job_location: event.job_location,
+                customer: {
+                    id: event.customer_id,
+                    name: event.customer_name,
+                    email: event.customer_email,
+                    phone: event.customer_phone,
+                    address: event.address
+                },
+                ext_po_number: event.ext_po_number,
+                custom_number: event.custom_number,
+                grand_total: event.grand_total,
+                status: event.status,
+                is_delivered: event.is_delivered,
+                package_list: event.package_list
+            }));
+            return {
+                content: [{
+                        type: "text",
+                        text: JSON.stringify({
+                            date_range: { from: params.from_date, to: params.to_date },
+                            total_events: formatted.length,
+                            events: formatted
+                        }, null, 2)
+                    }]
+            };
+        }
+        catch (error) {
+            return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+        }
+    });
 }
 export function registerAllTools(server) {
     console.log("Registering utility tools...");
