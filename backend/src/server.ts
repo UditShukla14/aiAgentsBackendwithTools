@@ -14,6 +14,7 @@ import { globalRateLimiter, RetryManager } from "./rate-limiter.js";
 import { SYSTEM_PROMPT } from './resources/prompts.js';
 import { allowedOrigins } from './resources/staticData.js';
 import { filterInternalIds, classifyQuery, getSystemPrompt, getMaxTokens } from "./server-util.js";
+import { pathToFileURL } from 'url';
 
 dotenv.config();
 
@@ -1030,7 +1031,7 @@ async function initializeAutoConnect(mcpServiceInstance: any, MCP_SERVER_PATH: s
     console.log('🔄 Attempting auto-connection to MCP server at:', serverPath);
     // Check if file exists before attempting connection
     try {
-      await import(serverPath);
+      await import(pathToFileURL(serverPath).href);
     } catch (error) {
       throw new Error(`MCP server file not found at ${serverPath}. Please ensure the file exists and the path is correct.`);
     }
