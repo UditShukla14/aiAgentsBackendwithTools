@@ -1033,7 +1033,8 @@ async function initializeAutoConnect(mcpServiceInstance: any, MCP_SERVER_PATH: s
     try {
       await import(pathToFileURL(serverPath).href);
     } catch (error) {
-      throw new Error(`MCP server file not found at ${serverPath}. Please ensure the file exists and the path is correct.`);
+      console.error("Dynamic import failed with error:", error);
+      throw new Error(`MCP server file not found at ${serverPath}. Please ensure the file exists and the path is correct. Original error: ${error}`);
     }
     await connectToServer(mcpServiceInstance, serverPath);
     console.log('✅ Successfully auto-connected to MCP server');
