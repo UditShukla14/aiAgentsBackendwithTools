@@ -25,7 +25,7 @@ const __dirname = path.dirname(__filename);
 // Dynamically resolve MCP server path for dev/prod
 const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || (
   process.env.NODE_ENV === 'production'
-    ? path.resolve(__dirname, '../../mcp-server/dist/mcp-server.js')
+    ? path.resolve(__dirname, '../../mcp-server/mcp-server.ts')
     : path.resolve(__dirname, '../../mcp-server/mcp-server.ts')
 );
 
