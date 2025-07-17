@@ -1,6 +1,7 @@
 // tools.ts
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+
 // Static data for MCP server tools
 
 export const BASE_URL = "https://invoicemakerpro.com";
@@ -1633,13 +1634,168 @@ export function registerBusinessTools(server: McpServer) {
       }
     }
   );
+
   
-  }
+}
+
+// Register analytics tools (for chart-ready business analysis)
+export function registerAnalyticsTools(server: McpServer) {
+  server.tool(
+    "analyzeBusinessData",
+    "Analyze business data and return chart-ready JSON for infographics. Supports queries like 'total sale for customer {customer name}'.",
+    {
+      analysis_type: z.enum(["total_sale_for_customer"]).describe("Type of analysis to perform. Currently supports: total_sale_for_customer"),
+      customer_name: z.string().optional().describe("Customer name for customer-specific analysis"),
+      from_date: z.string().optional().describe("Start date filter (YYYY-MM-DD format)"),
+      to_date: z.string().optional().describe("End date filter (YYYY-MM-DD format)"),
+    },
+    async ({ analysis_type, customer_name, from_date, to_date }) => {
+      try {
+        if (analysis_type === "total_sale_for_customer") {
+          if (!customer_name) {
+            return {
+              content: [{ type: "text", text: "Error: customer_name is required for this analysis." }]
+            };
+          }
+
+          // 1. Directly get all estimates for this customer_name as search term
+          const estimateSearch = await callIMPApi("/api/estimate/list", {
+            search: customer_name,
+            take: 1000,
+            ...(from_date && { from_date }),
+            ...(to_date && { to_date })
+          });
+          if (!estimateSearch.success) {
+            return { content: [{ type: "text", text: `Error fetching estimates: ${estimateSearch.message}` }] };
+          }
+          const estimates = estimateSearch.result || [];
+
+          // 2. Directly get all invoices for this customer_name as search term
+          const invoiceSearch = await callIMPApi("/api/invoice_list", {
+            search: customer_name,
+            take: 1000,
+            ...(from_date && { from_date }),
+            ...(to_date && { to_date })
+          });
+          if (!invoiceSearch.success) {
+            return { content: [{ type: "text", text: `Error fetching invoices: ${invoiceSearch.message}` }] };
+          }
+          const invoices = invoiceSearch.result || [];
+
+          // If no data found, show a clear message
+          if (estimates.length === 0 && invoices.length === 0) {
+            return {
+              content: [
+                { type: "text", text: `No sales data (estimates or invoices) found for customer name: '${customer_name}'. Try a different or more specific name.` }
+              ]
+            };
+          }
+
+          // Optionally, try to find a customer for display purposes (not for filtering)
+          let customerDisplayName = customer_name;
+          if (estimates.length > 0 && estimates[0].customer_name) {
+            customerDisplayName = estimates[0].customer_name;
+          } else if (invoices.length > 0 && invoices[0].customer_name) {
+            customerDisplayName = invoices[0].customer_name;
+          }
+
+          // 3. Aggregate statuses for estimates and invoices
+          const estimateStatusCounts: Record<string, number> = {};
+          let openEstimates = 0, closedEstimates = 0;
+          for (const est of estimates) {
+            const status = (est.status_name || '').toLowerCase();
+            estimateStatusCounts[status] = (estimateStatusCounts[status] || 0) + 1;
+            if (status.includes('open') || status.includes('pending') || status.includes('draft')) openEstimates++;
+            else if (status.includes('closed') || status.includes('accepted') || status.includes('won') || status.includes('converted')) closedEstimates++;
+          }
+
+          const invoiceStatusCounts: Record<string, number> = {};
+          let openInvoices = 0, paidInvoices = 0;
+          for (const inv of invoices) {
+            const status = (inv.status_name || '').toLowerCase();
+            invoiceStatusCounts[status] = (invoiceStatusCounts[status] || 0) + 1;
+            if (status.includes('open') || status.includes('unpaid') || status.includes('pending')) openInvoices++;
+            else if (status.includes('paid') || status.includes('closed') || status.includes('complete')) paidInvoices++;
+          }
+
+          // 4. Conversion rate: closed/accepted/converted estimates that have a corresponding invoice
+          let convertedEstimates = closedEstimates;
+          let conversionRate = estimates.length > 0 ? (convertedEstimates / estimates.length) * 100 : 0;
+
+          // 5. Totals
+          let totalEstimateAmount = 0;
+          let totalInvoiceAmount = 0;
+          for (const est of estimates) {
+            let val = 0;
+            if (est.totals && est.totals.grand_total) val = parseFloat(est.totals.grand_total);
+            else if (est.grand_total) val = parseFloat(est.grand_total);
+            else if (est.quotation_total) val = parseFloat(est.quotation_total);
+            if (!isNaN(val)) totalEstimateAmount += val;
+          }
+          for (const inv of invoices) {
+            let val = 0;
+            if (inv.totals && inv.totals.grand_total) val = parseFloat(inv.totals.grand_total);
+            else if (inv.grand_total) val = parseFloat(inv.grand_total);
+            if (!isNaN(val)) totalInvoiceAmount += val;
+          }
+
+          // 6. Chart-ready JSON for open vs closed estimates (with colors)
+          const estimateChart = {
+            chartType: "pie",
+            title: `Estimates Status for ${customerDisplayName}`,
+            labels: ["Open", "Closed"],
+            datasets: [
+              {
+                label: "Estimates",
+                data: [openEstimates, closedEstimates],
+                backgroundColor: ["#36A2EB", "#4BC0C0"] // blue, teal
+              }
+            ]
+          };
+
+          // 7. Chart-ready JSON for open vs paid invoices (with colors)
+          const invoiceChart = {
+            chartType: "pie",
+            title: `Invoices Status for ${customerDisplayName}`,
+            labels: ["Open", "Paid"],
+            datasets: [
+              {
+                label: "Invoices",
+                data: [openInvoices, paidInvoices],
+                backgroundColor: ["#FF6384", "#36A2EB"] // red, blue
+              }
+            ]
+          };
+         
+          // 9. Human summary string
+          // const summaryString = await generateSummaryWithClaude({ estimateChart, invoiceChart }); // Removed Anthropic call
+          // 10. Only return chart JSON, no summary, no [DISPLAY_VERBATIM]
+          const chartJson = {
+            estimateChart,
+            invoiceChart,
+            summary: `Summary for ${customerDisplayName}:\n- Total Estimates: ${estimates.length}\n- Total Invoices: ${invoices.length}\n- Total Estimate Amount: $${totalEstimateAmount.toLocaleString()}\n- Total Invoice Amount: $${totalInvoiceAmount.toLocaleString()}\n- Open Estimates: ${openEstimates}\n- Closed Estimates: ${closedEstimates}\n- Open Invoices: ${openInvoices}\n- Paid Invoices: ${paidInvoices}\n- Conversion Rate: ${conversionRate.toFixed(2)}%`
+          };
+          return {
+            content: [
+              { type: "text", text: JSON.stringify(chartJson, null, 2) }
+            ]
+          };
+        }
+        // Add more analysis types here as needed
+        return { content: [{ type: "text", text: `Error: Unsupported analysis_type '${analysis_type}'.` }] };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      }
+    }
+  );
+}
 
 export function registerAllTools(server: McpServer) {
   console.log("Registering utility tools...");
   registerUtilityTools(server);
   console.log("Registering business tools...");
   registerBusinessTools(server);
+  console.log("Registering analytics tools...");
+  registerAnalyticsTools(server);
   console.log("All tools registered!");
 } 

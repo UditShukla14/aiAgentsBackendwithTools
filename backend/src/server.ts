@@ -30,9 +30,21 @@ const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || (
     : path.resolve(__dirname, '../../mcp-server/mcp-server.ts')
 );
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-if (!ANTHROPIC_API_KEY) {
-  throw new Error("ANTHROPIC_API_KEY is not set");
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+if (!anthropicApiKey) {
+  throw new Error("ANTHROPIC_API_KEY is not set in the environment");
+}
+const anthropic = new Anthropic({ apiKey: anthropicApiKey });
+
+async function generateSummaryWithClaude(chartJson: any) {
+  const prompt = `
+You are an expert business analyst. Given the following sales analytics data as JSON, write a concise, insightful summary for a business user. Highlight key metrics, trends, and any notable insights.\n\nData:\n${JSON.stringify(chartJson, null, 2)}\n\nSummary:`;
+  const response = await anthropic.messages.create({
+    model: "claude-3-5-sonnet-20241022",
+    max_tokens: 256,
+    messages: [{ role: "user", content: prompt }]
+  });
+  return response.content?.[0]?.text?.trim() || "";
 }
 
 const app = express();
@@ -84,7 +96,7 @@ class MCPBackendService {
 
   constructor() {
     this.anthropic = new Anthropic({
-      apiKey: ANTHROPIC_API_KEY,
+      apiKey: anthropicApiKey,
     });
     this.mcp = new Client({ name: "mcp-client-web", version: "1.0.0" });
     this.contextManager = new ContextManager();
@@ -107,6 +119,14 @@ class MCPBackendService {
     }
     
     if (queryType === 'business') {
+      // --- PRIORITY: Analytics/Sales queries ---
+      const analyticsKeywords = [
+        'total sale', 'sales for customer', 'revenue', 'total revenue', 'analyze', 'analytics', 'total sales', 'customer sales', 'customer revenue', 'sales analysis', 'sales analytics', 'sales report', 'sales summary'
+      ];
+      if (analyticsKeywords.some(keyword => lowerQuery.includes(keyword)) || 
+          (lowerQuery.includes('sales') && lowerQuery.includes('customer'))) {
+        return this.tools.filter(tool => tool.name.toLowerCase().includes('analyzebusinessdata'));
+      }
       // Filter tools based on query content for better token efficiency
       const relevantTools = this.tools.filter(tool => {
         const toolName = tool.name.toLowerCase();
@@ -520,9 +540,12 @@ private async processToolCallsWithStreaming(
     });
 
     // Check cache first
-    let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
+    let result = null;
+    if (toolName !== 'analyzeBusinessData') {
+      result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
+    }
     
-    if (!result || toolName === 'date-utility') { // Skip cache for date-utility
+    if (!result || toolName === 'date-utility') { // Skip cache for date-utility and analytics
       // Enhance tool arguments with context
       const enhancedArgs = await this.contextManager.enhanceToolArguments(
         sessionId,
@@ -542,10 +565,10 @@ private async processToolCallsWithStreaming(
         
         console.log("Tool result:", JSON.stringify(result, null, 2));
         
-        // Cache the result
+        // Cache the result (but NOT for analyzeBusinessData)
         const cacheTime = toolName.includes('search') ? 300 : 
                          toolName === 'date-utility' ? 0 : 3600; // Don't cache date-utility
-        if (cacheTime > 0) {
+        if (cacheTime > 0 && toolName !== 'analyzeBusinessData') {
           await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
         }
         
@@ -593,72 +616,28 @@ private async processToolCallsWithStreaming(
       is_error: result.isError || false,
     });
 
-    // After getting the result for a customer search tool, set last customer context
-    if ((toolName === 'findCustomerByName' || toolName === 'searchCustomerList') && result && result.content && result.content[0] && result.content[0].text) {
-      const rawText = result.content[0].text;
-      console.log('[DEBUG] Raw tool result text:', rawText);
-      let data: any = null;
+    // Special handling for analyzeBusinessData: generate summary and send both chart and summary
+    if (
+      toolName === "analyzeBusinessData" &&
+      result.content &&
+      Array.isArray(result.content) &&
+      result.content[0]?.type === "text"
+    ) {
       try {
-        // Try to extract JSON object from the string
-        const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          data = JSON.parse(jsonMatch[0]);
-          console.log('[DEBUG] Extracted and parsed JSON:', data);
-        } else {
-          console.log('[DEBUG] No JSON object found in tool result text');
-        }
-        if (data) {
-          // Use data.result if present
-          const dataForSummary = data.result || data;
-          const customerName = dataForSummary.customer_name || dataForSummary.name || '';
-          if (customerName) {
-            // Set the address confirmation flag in context
-            const sessionContext = await this.contextManager.getSession(sessionId);
-            if (sessionContext) {
-              sessionContext.activeEntities.customerId = dataForSummary.id?.toString() || dataForSummary.customer_id?.toString();
-              sessionContext.activeEntities.customerName = customerName;
-              sessionContext.activeEntities.awaitingAddressConfirmation = true;
-              sessionContext.activeEntities.awaitingAddressCustomerId = sessionContext.activeEntities.customerId;
-              await this.contextManager.saveContext(sessionId, sessionContext);
-              console.log('[DEBUG] Setting address confirmation flag for customerId:', sessionContext.activeEntities.customerId);
-              console.log('[DEBUG] After customer search, activeEntities:', JSON.stringify(sessionContext.activeEntities, null, 2));
-            }
-            // Build a customer summary (customize as needed)
-            const summary = [
-              `Customer: ${customerName}`,
-              dataForSummary.email ? `Email: ${dataForSummary.email}` : null,
-              dataForSummary.phone ? `Phone: ${dataForSummary.phone}` : null,
-              dataForSummary.type_of_customer ? `Type: ${dataForSummary.type_of_customer}` : null,
-              dataForSummary.status_name ? `Status: ${dataForSummary.status_name}` : null
-            ].filter(Boolean).join('\n');
-            // Combine summary and prompt
-            const addressPrompt = 'Would you like to see this customer’s address? (yes/no)';
-            const combinedMessage = `${summary}\n\n${addressPrompt}`;
-            // DEBUG LOGGING
-            console.log('[DEBUG] ===== CUSTOMER SEARCH RESPONSE =====');
-            console.log('[DEBUG] Summary:', summary);
-            console.log('[DEBUG] Address prompt:', addressPrompt);
-            console.log('[DEBUG] Combined message:', combinedMessage);
-            console.log('[DEBUG] Combined message length:', combinedMessage.length);
-            console.log('[DEBUG] ======================================');
-            // Send both together
-            await this.contextManager.addMessage(
-              sessionId,
-              'assistant',
-              combinedMessage
-            );
-            onChunk({
-              type: 'complete',
-              response: combinedMessage,
-              toolsUsed: [toolName],
-              queryType: 'business',
-              tokensOptimized: true
-            });
-            return;
-          }
-        }
+        const chartJson = JSON.parse(result.content[0].text);
+        onChunk({
+          type: "complete",
+          response: `[DISPLAY_VERBATIM]${JSON.stringify(chartJson, null, 2)}`,
+          toolsUsed: [toolName]
+        });
+        return;
       } catch (e) {
-        console.log('[DEBUG] Failed to parse extracted JSON:', e);
+        onChunk({
+          type: "complete",
+          response: result.content[0].text,
+          toolsUsed: [toolName]
+        });
+        return;
       }
     }
   }
