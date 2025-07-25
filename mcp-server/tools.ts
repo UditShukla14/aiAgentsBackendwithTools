@@ -497,7 +497,7 @@ export function registerUtilityTools(server: McpServer) {
 export function registerBusinessTools(server: McpServer) {
   server.tool(
     "searchProductList",
-    "Search for products by name, SKU, or description. Use this for general product searches or when looking for multiple products. Returns a list of matching products.",
+    "Search for products by name, SKU, or description. Use this for general product searches or when looking for multiple products. Returns a list of matching products that is to be shown to use if asked for list of products.",
     {
       search: z.string().describe("Search query for product name, SKU, or description"),
       mode: z.enum(["lite", "full"]).default("lite").describe("Response mode - lite for basic info, full for detailed info"),

@@ -1,9 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Server, AlertCircle, CheckCircle, Loader2, MessageSquare, Settings, Wifi, WifiOff } from 'lucide-react';
+import { Send, Server, Loader2, MessageSquare, Settings, Wifi, WifiOff } from 'lucide-react';
 import { io, Socket } from 'socket.io-client';
 import { Bar, Line, Pie, Doughnut } from 'react-chartjs-2';
 import { Chart as ChartJS, CategoryScale, LinearScale, BarElement, PointElement, LineElement, ArcElement, Tooltip, Legend } from 'chart.js';
 import React from 'react';
+import {
+  useReactTable,
+  getCoreRowModel,
+  flexRender,
+} from '@tanstack/react-table';
+import type { ColumnDef } from '@tanstack/react-table';
 
 // Register ChartJS components
 ChartJS.register(CategoryScale, LinearScale, BarElement, PointElement, LineElement, ArcElement, Tooltip, Legend);
@@ -19,6 +25,7 @@ interface Message {
   content: string;
   toolUsed?: string | null;
   timestamp: string;
+  streaming?: boolean; // Added for streaming indicator
 }
 
 interface Tool {
@@ -154,6 +161,105 @@ const ChartMessage = React.memo(({ chartData }: { chartData: ChartData }) => {
     </div>
   );
 });
+
+// TanStack Table v8 component for JSON arrays
+const TanStackTable = ({ data }: { data: Array<Record<string, unknown>> }) => {
+  const columns = React.useMemo<ColumnDef<Record<string, unknown>>[]>(() => {
+    if (!data || data.length === 0) return [];
+    return Object.keys(data[0]).map((key) => ({
+      header: key,
+      accessorKey: key,
+    }));
+  }, [data]);
+
+  const table = useReactTable({
+    data,
+    columns,
+    getCoreRowModel: getCoreRowModel(),
+  });
+
+  if (!data || data.length === 0) return null;
+
+  return (
+    <div className="overflow-x-auto my-2">
+      <table className="min-w-full border border-gray-300 rounded-lg bg-white">
+        <thead>
+          {table.getHeaderGroups().map(headerGroup => (
+            <tr key={headerGroup.id}>
+              {headerGroup.headers.map(header => (
+                <th key={header.id} className="px-3 py-2 bg-blue-50 text-blue-900 font-semibold border-b border-gray-200">
+                  {flexRender(header.column.columnDef.header, header.getContext())}
+                </th>
+              ))}
+            </tr>
+          ))}
+        </thead>
+        <tbody>
+          {table.getRowModel().rows.map((row, i) => (
+            <tr key={row.id} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+              {row.getVisibleCells().map(cell => (
+                <td key={cell.id} className="px-3 py-2 border-b border-gray-100 text-gray-800">
+                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
+// Utility to extract markdown tables and JSON code blocks from text
+function extractTablesAndJson(text: string) {
+  const markdownTables: string[] = [];
+  const jsonBlocks: Array<Array<Record<string, unknown>>> = [];
+  // Extract markdown tables
+  const tableRegex = /((?:\|[^\n]+\|[^\n]*\n)+)/g;
+  let match;
+  while ((match = tableRegex.exec(text)) !== null) {
+    if (match[0].includes('|')) {
+      markdownTables.push(match[0].trim());
+    }
+  }
+  // Extract JSON code blocks
+  const jsonRegex = /```json\s*([\s\S]*?)```/g;
+  while ((match = jsonRegex.exec(text)) !== null) {
+    try {
+      const json = JSON.parse(match[1]);
+      if (Array.isArray(json) && json.length > 0 && typeof json[0] === 'object') {
+        jsonBlocks.push(json);
+      }
+    } catch {
+      // Ignore JSON parse errors
+    }
+  }
+  return { markdownTables, jsonBlocks };
+}
+
+// Utility to render message content with interleaved tables and text
+const renderMessageContent = (content: string) => {
+  // Split on JSON code blocks, keeping delimiters
+  const parts = content.split(/(```json[\s\S]*?```)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith('```json')) {
+      try {
+        const json = JSON.parse(part.replace(/```json|```/g, '').trim());
+        if (Array.isArray(json)) {
+          return <TanStackTable key={idx} data={json} />;
+        }
+      } catch {
+        // If JSON parse fails, just render as preformatted text
+        return <pre key={idx} className="bg-gray-50 rounded border border-gray-200 p-2 text-xs">{part}</pre>;
+      }
+    }
+    // Render non-table text, trimming empty lines
+    if (part.trim()) {
+      return <div key={idx} className="mb-2 whitespace-pre-line">{part.trim()}</div>;
+    }
+    return null;
+  });
+};
 
 const MCPClientUI = () => {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -329,7 +435,22 @@ const MCPClientUI = () => {
     const messageId = Date.now();
     addMessage('user', query);
 
+    // Add a placeholder assistant message for streaming
+    const streamingMsgId = messageId + Math.random();
+    setMessages(prev => [
+      ...prev,
+      deepFreeze({
+        id: streamingMsgId,
+        role: 'assistant',
+        content: '',
+        toolUsed: null,
+        timestamp: new Date().toLocaleTimeString(),
+        streaming: true,
+      })
+    ]);
+
     let accumulated = '';
+    setIsLoading(true);
     const toolsUsed: string[] = [];
 
     socketRef.current?.emit('process_query_stream', { query, messageId });
@@ -337,16 +458,43 @@ const MCPClientUI = () => {
     const onStream = (data: any) => {
       // Log all incoming data for debugging
       console.log('Received query_stream data:', data);
-      // Only handle 'complete' chunks for chat rendering
+      if (data.chunk?.type === 'text_delta') {
+        accumulated += data.chunk.delta;
+        setMessages(prev => {
+          // Update the last assistant message (streaming)
+          const updated = [...prev];
+          for (let i = updated.length - 1; i >= 0; i--) {
+            if (updated[i].role === 'assistant' && updated[i].streaming) {
+              updated[i] = { ...updated[i], content: accumulated };
+              break;
+            }
+          }
+          return updated;
+        });
+      }
       if (data.chunk?.type === 'complete') {
-        addMessage('assistant', data.chunk.response, toolsUsed.join(', '));
         setIsLoading(false);
+        setMessages(prev => {
+          // Finalize the last assistant message
+          const updated = [...prev];
+          for (let i = updated.length - 1; i >= 0; i--) {
+            if (updated[i].role === 'assistant' && updated[i].streaming) {
+              updated[i] = {
+                ...updated[i],
+                content: data.chunk.response,
+                toolUsed: toolsUsed.join(', '),
+                streaming: false,
+              };
+              break;
+            }
+          }
+          return updated;
+        });
         socketRef.current?.off('query_stream', onStream);
       }
-      // Ignore 'tool_result' and other chunk types for chat display
       if (data.chunk?.type === 'error') {
-        addMessage('error', data.chunk.message || 'Error during streaming');
         setIsLoading(false);
+        addMessage('error', data.chunk.message || 'Error during streaming');
         socketRef.current?.off('query_stream', onStream);
       }
     };
@@ -362,10 +510,19 @@ const MCPClientUI = () => {
     setInputValue('');
   };
 
+  // Add avatar mapping
+  const AVATARS = {
+    user: '🧑',
+    assistant: '🤖',
+    system: '💡',
+    error: '⚠️',
+  };
+
   const MessageBubble = React.memo(({ message }: { message: Message }) => {
     const isUser = message.role === 'user';
     const isSystem = message.role === 'system';
     const isError = message.role === 'error';
+    const isAssistant = message.role === 'assistant';
 
     // Try to parse multi-chart data robustly
     let parsedContent: unknown = message.content;
@@ -391,76 +548,70 @@ const MCPClientUI = () => {
         multiChartData = null;
       }
     }
-    console.log('MessageBubble content:', message.content);
+
+    // Don't render empty assistant bubbles (except for streaming/typing)
+    if (isAssistant && !message.content && !message.streaming) {
+      return null;
+    }
 
     return (
-      <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-4`}>
-        <div className={`max-w-[85%] rounded-2xl px-4 py-3 ${
-          isUser 
-            ? 'bg-gradient-to-r from-blue-500 to-blue-600 text-white shadow-lg' 
-            : isError 
-            ? 'bg-red-50 text-red-800 border border-red-200'
-            : isSystem 
-            ? 'bg-gray-50 text-gray-700 border border-gray-200'
-            : 'bg-white text-gray-800 border border-gray-100 shadow-md'
-        }`}>
-          {!isUser && !isSystem && !isError && (
-            <div className="flex items-center gap-2 mb-2">
-              <div className="w-6 h-6 bg-gradient-to-r from-purple-500 to-blue-500 rounded-full flex items-center justify-center">
-                <MessageSquare className="w-3 h-3 text-white" />
+      <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} mb-2`}>
+        <div className={`flex items-end gap-2 ${isUser ? 'flex-row-reverse' : ''}`}>
+          {/* Avatar */}
+          <div className="w-8 h-8 flex items-center justify-center rounded-full bg-gray-200 text-xl">
+            {AVATARS[message.role]}
+          </div>
+          {/* Bubble */}
+          <div
+            className={`rounded-xl px-4 py-2 shadow max-w-[70vw] whitespace-pre-wrap text-sm leading-relaxed
+              ${isUser ? 'bg-blue-500 text-white' : isAssistant ? 'bg-gray-100 text-gray-900' : isSystem ? 'bg-yellow-100 text-gray-800' : 'bg-red-100 text-red-800'}
+              ${isError ? 'border border-red-400' : ''}
+            `}
+            style={{ minWidth: 40 }}
+          >
+            {/* Streaming assistant: show typing indicator if no content yet */}
+            {isAssistant && message.streaming && !message.content && (
+              <div className="flex items-center gap-2">
+                <div className="animate-bounce w-2 h-2 bg-gray-400 rounded-full" />
+                <div className="animate-bounce w-2 h-2 bg-gray-400 rounded-full delay-150" />
+                <div className="animate-bounce w-2 h-2 bg-gray-400 rounded-full delay-300" />
               </div>
-              <span className="text-sm font-medium text-gray-600">Claude</span>
-              {message.toolUsed && (
-                <div className="flex items-center gap-1 px-2 py-1 bg-blue-50 rounded-full">
-                  <Settings className="w-3 h-3 text-blue-600" />
-                  <span className="text-xs text-blue-600 font-medium">{message.toolUsed}</span>
+            )}
+            {/* Streaming assistant: show content as it arrives */}
+            {isAssistant && message.streaming && message.content && (
+              <span>{message.content}</span>
+            )}
+            {/* Assistant (not streaming), user, system, error: show content normally */}
+            {!message.streaming && multiChartData ? (
+              <div>
+                <div className="flex flex-row flex-wrap gap-6">
+                  {multiChartData.charts.map((chart, idx) => (
+                    <div key={idx} className="mb-4 bg-white rounded-xl shadow border p-4 min-w-[300px] max-w-[400px] flex-1">
+                      {chart.title && <div className="font-semibold mb-2 text-center">{chart.title}</div>}
+                      <ChartMessage chartData={chart} />
+                    </div>
+                  ))}
                 </div>
-              )}
-            </div>
-          )}
-          
-          {isSystem && (
-            <div className="flex items-center gap-2 mb-1">
-              <CheckCircle className="w-4 h-4 text-green-500" />
-              <span className="text-sm font-medium">System</span>
-            </div>
-          )}
-          
-          {isError && (
-            <div className="flex items-center gap-2 mb-1">
-              <AlertCircle className="w-4 h-4 text-red-500" />
-              <span className="text-sm font-medium">Error</span>
-            </div>
-          )}
-          
-          {multiChartData ? (
-            <div>
-              <div className="flex flex-row flex-wrap gap-6">
-                {multiChartData.charts.map((chart, idx) => (
-                  <div key={idx} className="mb-4 bg-white rounded-xl shadow border p-4 min-w-[300px] max-w-[400px] flex-1">
-                    {chart.title && <div className="font-semibold mb-2 text-center">{chart.title}</div>}
-                    <ChartMessage chartData={chart} />
-                  </div>
-                ))}
+                {multiChartData.summary && (
+                  typeof multiChartData.summary === 'string' ? (
+                    <div className="mt-4 text-gray-700 whitespace-pre-wrap">
+                      <strong>Summary:</strong>
+                      <div className="bg-gray-50 rounded p-2 mt-1">{multiChartData.summary}</div>
+                    </div>
+                  ) : (
+                    <div className="mt-4 text-gray-700 whitespace-pre-wrap">
+                      <strong>Summary:</strong>
+                      <pre className="bg-gray-50 rounded p-2 mt-1">{JSON.stringify(multiChartData.summary, null, 2)}</pre>
+                    </div>
+                  )
+                )}
               </div>
-              {multiChartData.summary && (
-                typeof multiChartData.summary === 'string' ? (
-                  <div className="mt-4 text-gray-700 whitespace-pre-wrap">
-                    <strong>Summary:</strong>
-                    <div className="bg-gray-50 rounded p-2 mt-1">{multiChartData.summary}</div>
-                  </div>
-                ) : (
-                  <div className="mt-4 text-gray-700 whitespace-pre-wrap">
-                    <strong>Summary:</strong>
-                    <pre className="bg-gray-50 rounded p-2 mt-1">{JSON.stringify(multiChartData.summary, null, 2)}</pre>
-                  </div>
-                )
-              )}
-            </div>
-          ) : (
-            <div className="whitespace-pre-wrap text-sm leading-relaxed">{message.content}</div>
-          )}
-          <div className="text-xs opacity-60 mt-2">{message.timestamp}</div>
+            ) : null}
+            {!message.streaming && !multiChartData && message.content && (
+              <div>{renderMessageContent(message.content)}</div>
+            )}
+            <div className="text-xs opacity-60 mt-2">{message.timestamp}</div>
+          </div>
         </div>
       </div>
     );
@@ -472,6 +623,7 @@ const MCPClientUI = () => {
       {messages.map((message) => (
         <MessageBubble key={message.id} message={message} />
       ))}
+      {/* Remove global typing indicator, now handled in bubble */}
     </>
   ));
 
@@ -578,16 +730,6 @@ const MCPClientUI = () => {
           ) : (
             <div>
               <MessageList messages={messages} />
-              {isLoading && (
-                <div className="flex justify-start mb-4">
-                  <div className="bg-white/80 backdrop-blur-sm border border-gray-200/50 rounded-2xl px-6 py-4 shadow-lg">
-                    <div className="flex items-center gap-3">
-                      <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
-                      <span className="text-gray-600 font-medium">Claude is thinking...</span>
-                    </div>
-                  </div>
-                </div>
-              )}
               <div ref={messagesEndRef} />
             </div>
           )}

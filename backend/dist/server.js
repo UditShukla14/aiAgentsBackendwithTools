@@ -11,39 +11,10 @@ import { randomUUID } from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { globalRateLimiter, RetryManager } from "./rate-limiter.js";
-import { SYSTEM_PROMPT, GREETING_PROMPT, SIMPLE_PROMPT, BUSINESS_PROMPT } from './resources/prompts.js';
-import { greetings, dateKeywords, simplePatterns, businessKeywords, complexPatterns, allowedOrigins } from './resources/staticData.js';
-// Utility to remove internal IDs from user-facing text
-function filterInternalIds(text) {
-    // Remove lines containing internal IDs (id, customer_id, product_id, invoice_id, etc.)
-    return text.replace(/\b(id|customer_id|product_id|invoice_id|estimate_id|user_id|quickbook_customer_id|handshake_key|assign_employee_user_id)\b\s*[:=]\s*['"\d\w-]+,?/gi, '')
-        .replace(/\b(id|customer_id|product_id|invoice_id|estimate_id|user_id|quickbook_customer_id|handshake_key|assign_employee_user_id)\b\s*[:=]\s*['"\d\w-]+/gi, '')
-        .replace(/\n\s*\n/g, '\n') // Remove extra blank lines
-        .replace(/\{\s*,/g, '{') // Remove leading commas in objects
-        .replace(/,\s*\}/g, '}'); // Remove trailing commas in objects
-}
-// Utility to format address responses for end users
-function formatAddressResponse(text) {
-    // Remove [DISPLAY_VERBATIM]
-    let cleaned = text.replace('[DISPLAY_VERBATIM]', '').trim();
-    // If it looks like an address block, format it nicely
-    if (/address[:]?/i.test(cleaned)) {
-        // Try to split after 'Address:' or on the next line
-        const match = cleaned.match(/(.*Address:?)([\s\S]*)/i);
-        if (match) {
-            const label = match[1].trim();
-            let address = match[2].trim();
-            // If address is empty, try to get the next line
-            if (!address && cleaned.includes('\n')) {
-                address = cleaned.split('\n').slice(1).join('\n').trim();
-            }
-            // Split address by commas, trim, and join as lines
-            const lines = address.split(',').map(line => line.trim()).filter(Boolean);
-            return `${label}\n${lines.join('\n')}`;
-        }
-    }
-    return cleaned;
-}
+import { SYSTEM_PROMPT } from './resources/prompts.js';
+import { allowedOrigins } from './resources/staticData.js';
+import { filterInternalIds, classifyQuery, getSystemPrompt, getMaxTokens } from "./server-util.js";
+import { pathToFileURL } from 'url';
 dotenv.config();
 // Add MCP server path configuration
 // Resolve __dirname in ES module context
@@ -53,9 +24,20 @@ const __dirname = path.dirname(__filename);
 const MCP_SERVER_PATH = process.env.MCP_SERVER_PATH || (process.env.NODE_ENV === 'production'
     ? path.resolve(__dirname, '../../mcp-server/dist/mcp-server.js')
     : path.resolve(__dirname, '../../mcp-server/mcp-server.ts'));
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-if (!ANTHROPIC_API_KEY) {
-    throw new Error("ANTHROPIC_API_KEY is not set");
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+if (!anthropicApiKey) {
+    throw new Error("ANTHROPIC_API_KEY is not set in the environment");
+}
+const anthropic = new Anthropic({ apiKey: anthropicApiKey });
+async function generateSummaryWithClaude(chartJson) {
+    const prompt = `
+You are an expert business analyst. Given the following sales analytics data as JSON, write a concise, insightful summary for a business user. Highlight key metrics, trends, and any notable insights.\n\nData:\n${JSON.stringify(chartJson, null, 2)}\n\nSummary:`;
+    const response = await anthropic.messages.create({
+        model: "claude-3-5-sonnet-20241022",
+        max_tokens: 256,
+        messages: [{ role: "user", content: prompt }]
+    });
+    return response.content?.[0]?.text?.trim() || "";
 }
 const app = express();
 const httpServer = createServer(app);
@@ -91,54 +73,15 @@ class MCPBackendService {
     contextManager;
     autoConnectRetries = 0;
     maxAutoConnectRetries = 3;
+    StdioClientTransport = StdioClientTransport;
     constructor() {
         this.anthropic = new Anthropic({
-            apiKey: ANTHROPIC_API_KEY,
+            apiKey: anthropicApiKey,
         });
         this.mcp = new Client({ name: "mcp-client-web", version: "1.0.0" });
         this.contextManager = new ContextManager();
-        // Start auto-connection process
-        this.initializeAutoConnect();
-    }
-    // Smart query classification for token optimization
-    classifyQuery(query) {
-        const lowerQuery = query.toLowerCase().trim();
-        // 1. Business queries that need tools (check first!)
-        if (businessKeywords.some(keyword => lowerQuery.includes(keyword))) {
-            return 'business';
-        }
-        // 2. Date-related queries
-        if (dateKeywords.some(keyword => lowerQuery.includes(keyword))) {
-            return 'business';
-        }
-        // 3. Complex analysis (multiple steps, comparisons, reports)
-        if (complexPatterns.some(pattern => lowerQuery.includes(pattern)) || lowerQuery.length > 150) {
-            return 'complex';
-        }
-        // 4. Simple questions and help requests (but not date/business/complex)
-        if (simplePatterns.some(pattern => lowerQuery.includes(pattern)) && lowerQuery.length < 100) {
-            return 'simple';
-        }
-        // 5. Greetings and social interactions (require full match or near-exact match)
-        if (greetings.some(greeting => lowerQuery === greeting || lowerQuery.startsWith(greeting + ' ') || lowerQuery.endsWith(' ' + greeting))) {
-            return 'greeting';
-        }
-        return 'simple';
-    }
-    // Dynamic system prompts for different query types
-    getSystemPrompt(queryType) {
-        switch (queryType) {
-            case 'greeting':
-                return GREETING_PROMPT;
-            case 'simple':
-                return SIMPLE_PROMPT;
-            case 'business':
-                return BUSINESS_PROMPT;
-            case 'complex':
-                return SYSTEM_PROMPT; // Full prompt for complex tasks
-            default:
-                return SYSTEM_PROMPT;
-        }
+        // Start auto-connection process using external function
+        initializeAutoConnect(this, MCP_SERVER_PATH);
     }
     // Smart tool filtering based on query type and content
     getRelevantTools(queryType, query) {
@@ -152,6 +95,14 @@ class MCPBackendService {
             return []; // No tools needed for greetings/simple queries
         }
         if (queryType === 'business') {
+            // --- PRIORITY: Analytics/Sales queries ---
+            const analyticsKeywords = [
+                'total sale', 'sales for customer', 'revenue', 'total revenue', 'analyze', 'analytics', 'total sales', 'customer sales', 'customer revenue', 'sales analysis', 'sales analytics', 'sales report', 'sales summary'
+            ];
+            if (analyticsKeywords.some(keyword => lowerQuery.includes(keyword)) ||
+                (lowerQuery.includes('sales') && lowerQuery.includes('customer'))) {
+                return this.tools.filter(tool => tool.name.toLowerCase().includes('analyzebusinessdata'));
+            }
             // Filter tools based on query content for better token efficiency
             const relevantTools = this.tools.filter(tool => {
                 const toolName = tool.name.toLowerCase();
@@ -170,7 +121,7 @@ class MCPBackendService {
                     if (toolName === 'date-utility')
                         return true;
                 }
-                const keywords = ['delivery', 'delivery board', 'delivery schedule', 'delivery tracking', 'delivery planning', 'delivery logistics', 'delivery daily', 'delivery weekly', 'delivery monthly', 'delivery yearly', 'delivery board', 'delivery schedule', 'delivery tracking', 'delivery planning', 'delivery logistics', 'delivery daily', 'delivery weekly', 'delivery monthly', 'delivery yearly', 'deliveries'];
+                const keywords = ['delivery', 'delivery board', 'delivery schedule', 'delivery tracking', 'delivery planning', 'delivery logistics', 'delivery daily', 'delivery weekly', 'delivery monthly', 'delivery yearly', 'delivery board', 'delivery schedule', 'delivery tracking', 'delivery planning', 'delivery logistics', 'delivery daily', 'delivery weekly', 'delivery monthly', 'delivery yearly', 'deliveries', 'deliver'];
                 // Delivery board queries
                 if (keywords.some(keyword => lowerQuery.includes(keyword)) && toolName.includes('delivery'))
                     return true;
@@ -214,91 +165,6 @@ class MCPBackendService {
             return relevantTools;
         }
         return this.tools; // All tools for complex queries
-    }
-    // Calculate max tokens based on query type
-    getMaxTokens(queryType) {
-        switch (queryType) {
-            case 'greeting': return 100;
-            case 'simple': return 300;
-            case 'business': return 1500;
-            case 'complex': return 2000;
-            default: return 2000;
-        }
-    }
-    async initializeAutoConnect() {
-        try {
-            const serverPath = MCP_SERVER_PATH;
-            console.log('🔄 Attempting auto-connection to MCP server at:', serverPath);
-            // Check if file exists before attempting connection
-            try {
-                await import(serverPath);
-            }
-            catch (error) {
-                throw new Error(`MCP server file not found at ${serverPath}. Please ensure the file exists and the path is correct.`);
-            }
-            await this.connectToServer(serverPath);
-            console.log('✅ Successfully auto-connected to MCP server');
-            this.autoConnectRetries = 0;
-        }
-        catch (error) {
-            this.autoConnectRetries++;
-            console.error(`❌ Auto-connection attempt ${this.autoConnectRetries} failed:`, error);
-            if (this.autoConnectRetries < this.maxAutoConnectRetries) {
-                const backoffMs = Math.min(1000 * Math.pow(2, this.autoConnectRetries), 10000);
-                console.log(`🔄 Retrying auto-connection in ${backoffMs / 1000} seconds...`);
-                setTimeout(() => this.initializeAutoConnect(), backoffMs);
-            }
-            else {
-                console.error('❌ Max auto-connection retries exceeded. Manual connection will be required.');
-            }
-        }
-    }
-    async connectToServer(serverScriptPath) {
-        try {
-            const isJs = serverScriptPath.endsWith(".js");
-            const isPy = serverScriptPath.endsWith(".py");
-            const isTs = serverScriptPath.endsWith(".ts");
-            if (!isJs && !isPy && !isTs) {
-                throw new Error("Server script must be a .js, .ts, or .py file");
-            }
-            let command;
-            let args;
-            if (isPy) {
-                command = process.platform === "win32" ? "python" : "python3";
-                args = [serverScriptPath];
-            }
-            else if (isTs) {
-                command = "npx";
-                args = ["tsx", serverScriptPath];
-            }
-            else {
-                command = process.execPath;
-                args = [serverScriptPath];
-            }
-            this.transport = new StdioClientTransport({
-                command,
-                args,
-            });
-            await this.mcp.connect(this.transport);
-            const toolsResult = await this.mcp.listTools();
-            this.tools = toolsResult.tools.map((tool) => {
-                return {
-                    name: tool.name,
-                    description: tool.description || "",
-                    input_schema: tool.inputSchema,
-                };
-            });
-            this.isConnected = true;
-            console.log("Connected to MCP server with tools:", this.tools.map(({ name }) => name).join(", "));
-            return {
-                success: true,
-                tools: this.tools.map(({ name, description }) => ({ name, description }))
-            };
-        }
-        catch (e) {
-            console.error("Failed to connect to MCP server:", e);
-            throw e;
-        }
     }
     // NEW: Streaming version of processQuery
     async processQueryStream(query, sessionId, onChunk) {
@@ -357,7 +223,7 @@ class MCPBackendService {
                 return;
             }
         }
-        const queryType = this.classifyQuery(query);
+        const queryType = classifyQuery(query);
         console.log(`🎯 Query classified as: ${queryType} | Length: ${query.length} chars`);
         // Add user message to context
         await this.contextManager.addMessage(sessionId, 'user', query);
@@ -380,9 +246,9 @@ Current conversation context:
             }
         }
         // Get optimized system prompt and tools
-        const systemPrompt = this.getSystemPrompt(queryType);
+        const systemPrompt = getSystemPrompt(queryType);
         const relevantTools = this.getRelevantTools(queryType, query);
-        const maxTokens = this.getMaxTokens(queryType);
+        const maxTokens = getMaxTokens(queryType);
         // Build dynamic context string
         const activeEntities = toolContext?.activeEntities;
         const dynamicContext = activeEntities && activeEntities.customerName
@@ -590,8 +456,11 @@ Current conversation context:
                 args: originalArgs
             });
             // Check cache first
-            let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
-            if (!result || toolName === 'date-utility') { // Skip cache for date-utility
+            let result = null;
+            if (toolName !== 'analyzeBusinessData') {
+                result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
+            }
+            if (!result || toolName === 'date-utility') { // Skip cache for date-utility and analytics
                 // Enhance tool arguments with context
                 const enhancedArgs = await this.contextManager.enhanceToolArguments(sessionId, toolName, originalArgs || {}, originalQuery);
                 console.log(`🧠 Context: Tool ${toolName} enhanced arguments:`, JSON.stringify(enhancedArgs, null, 2));
@@ -602,10 +471,10 @@ Current conversation context:
                         arguments: enhancedArgs,
                     });
                     console.log("Tool result:", JSON.stringify(result, null, 2));
-                    // Cache the result
+                    // Cache the result (but NOT for analyzeBusinessData)
                     const cacheTime = toolName.includes('search') ? 300 :
                         toolName === 'date-utility' ? 0 : 3600; // Don't cache date-utility
-                    if (cacheTime > 0) {
+                    if (cacheTime > 0 && toolName !== 'analyzeBusinessData') {
                         await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
                     }
                     // Always record tool usage (which updates activeEntities) with the raw tool result
@@ -650,70 +519,27 @@ Current conversation context:
                 content: result.content || [{ type: "text", text: JSON.stringify(result) }],
                 is_error: result.isError || false,
             });
-            // After getting the result for a customer search tool, set last customer context
-            if ((toolName === 'findCustomerByName' || toolName === 'searchCustomerList') && result && result.content && result.content[0] && result.content[0].text) {
-                const rawText = result.content[0].text;
-                console.log('[DEBUG] Raw tool result text:', rawText);
-                let data = null;
+            // Special handling for analyzeBusinessData: generate summary and send both chart and summary
+            if (toolName === "analyzeBusinessData" &&
+                result.content &&
+                Array.isArray(result.content) &&
+                result.content[0]?.type === "text") {
                 try {
-                    // Try to extract JSON object from the string
-                    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-                    if (jsonMatch) {
-                        data = JSON.parse(jsonMatch[0]);
-                        console.log('[DEBUG] Extracted and parsed JSON:', data);
-                    }
-                    else {
-                        console.log('[DEBUG] No JSON object found in tool result text');
-                    }
-                    if (data) {
-                        // Use data.result if present
-                        const dataForSummary = data.result || data;
-                        const customerName = dataForSummary.customer_name || dataForSummary.name || '';
-                        if (customerName) {
-                            // Set the address confirmation flag in context
-                            const sessionContext = await this.contextManager.getSession(sessionId);
-                            if (sessionContext) {
-                                sessionContext.activeEntities.customerId = dataForSummary.id?.toString() || dataForSummary.customer_id?.toString();
-                                sessionContext.activeEntities.customerName = customerName;
-                                sessionContext.activeEntities.awaitingAddressConfirmation = true;
-                                sessionContext.activeEntities.awaitingAddressCustomerId = sessionContext.activeEntities.customerId;
-                                await this.contextManager.saveContext(sessionId, sessionContext);
-                                console.log('[DEBUG] Setting address confirmation flag for customerId:', sessionContext.activeEntities.customerId);
-                                console.log('[DEBUG] After customer search, activeEntities:', JSON.stringify(sessionContext.activeEntities, null, 2));
-                            }
-                            // Build a customer summary (customize as needed)
-                            const summary = [
-                                `Customer: ${customerName}`,
-                                dataForSummary.email ? `Email: ${dataForSummary.email}` : null,
-                                dataForSummary.phone ? `Phone: ${dataForSummary.phone}` : null,
-                                dataForSummary.type_of_customer ? `Type: ${dataForSummary.type_of_customer}` : null,
-                                dataForSummary.status_name ? `Status: ${dataForSummary.status_name}` : null
-                            ].filter(Boolean).join('\n');
-                            // Combine summary and prompt
-                            const addressPrompt = 'Would you like to see this customer’s address? (yes/no)';
-                            const combinedMessage = `${summary}\n\n${addressPrompt}`;
-                            // DEBUG LOGGING
-                            console.log('[DEBUG] ===== CUSTOMER SEARCH RESPONSE =====');
-                            console.log('[DEBUG] Summary:', summary);
-                            console.log('[DEBUG] Address prompt:', addressPrompt);
-                            console.log('[DEBUG] Combined message:', combinedMessage);
-                            console.log('[DEBUG] Combined message length:', combinedMessage.length);
-                            console.log('[DEBUG] ======================================');
-                            // Send both together
-                            await this.contextManager.addMessage(sessionId, 'assistant', combinedMessage);
-                            onChunk({
-                                type: 'complete',
-                                response: combinedMessage,
-                                toolsUsed: [toolName],
-                                queryType: 'business',
-                                tokensOptimized: true
-                            });
-                            return;
-                        }
-                    }
+                    const chartJson = JSON.parse(result.content[0].text);
+                    onChunk({
+                        type: "complete",
+                        response: `[DISPLAY_VERBATIM]${JSON.stringify(chartJson, null, 2)}`,
+                        toolsUsed: [toolName]
+                    });
+                    return;
                 }
                 catch (e) {
-                    console.log('[DEBUG] Failed to parse extracted JSON:', e);
+                    onChunk({
+                        type: "complete",
+                        response: result.content[0].text,
+                        toolsUsed: [toolName]
+                    });
+                    return;
                 }
             }
         }
@@ -852,7 +678,7 @@ Current conversation context:
                 // If no more tool calls, we're done
                 if (newToolCalls.length === 0) {
                     // Final response - save to context and complete
-                    await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(), toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined);
+                    await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim());
                     onChunk({
                         type: 'complete',
                         response: filterInternalIds(streamedContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(),
@@ -983,193 +809,6 @@ Current conversation context:
             }
         }
     }
-    // ORIGINAL: Non-streaming version (kept for compatibility)
-    async processQuery(query, sessionId) {
-        if (!this.isConnected) {
-            throw new Error("Not connected to MCP server");
-        }
-        const queryType = this.classifyQuery(query);
-        console.log(`🎯 Query classified as: ${queryType} | Length: ${query.length} chars`);
-        // Add user message to context
-        await this.contextManager.addMessage(sessionId, 'user', query);
-        // Smart context generation based on query type
-        let contextInfo = '';
-        let toolContext = null;
-        if (queryType === 'business' || queryType === 'complex') {
-            // Only generate full context for business/complex queries
-            toolContext = await this.contextManager.generateToolContext(sessionId, query);
-            contextInfo = `
-Current conversation context:
-- User intent: ${toolContext.userIntent}
-- Recent queries: ${toolContext.recentQueries.slice(-2).join(', ')}`;
-            const activeEntities = toolContext.activeEntities;
-            if (activeEntities.customerName) {
-                contextInfo += `\n- Active customer: ${activeEntities.customerName}`;
-            }
-            if (activeEntities.productName) {
-                contextInfo += `\n- Active product: ${activeEntities.productName}`;
-            }
-        }
-        // Get optimized system prompt and tools
-        const systemPrompt = this.getSystemPrompt(queryType);
-        const relevantTools = this.getRelevantTools(queryType, query);
-        const maxTokens = this.getMaxTokens(queryType);
-        // Build dynamic context string
-        const activeEntities = toolContext?.activeEntities;
-        const dynamicContext = activeEntities && activeEntities.customerName
-            ? `The customer "${activeEntities.customerName}" was found via a secure business tool. It is authorized to display their business address.`
-            : '';
-        const contextualSystemPrompt = systemPrompt.replace('[CONTEXT_PLACEHOLDER]', dynamicContext);
-        // Token optimization logging
-        console.log(`📊 Token optimization applied:
-- Query type: ${queryType}
-- System prompt: ${systemPrompt.length} chars (vs ${SYSTEM_PROMPT.length} full)
-- Tools included: ${relevantTools.length}/${this.tools.length}
-- Context info: ${contextInfo.length} chars
-- Max tokens: ${maxTokens}`);
-        const messages = [
-            {
-                role: "user",
-                content: query,
-            },
-        ];
-        try {
-            const response = await globalRateLimiter.execute(() => RetryManager.retryWithExponentialBackoff(() => this.anthropic.messages.create({
-                model: "claude-3-5-sonnet-20241022",
-                max_tokens: maxTokens,
-                system: contextualSystemPrompt,
-                messages,
-                tools: relevantTools,
-            })));
-            // For greetings and simple queries, return immediately (no tool processing needed)
-            if (queryType === 'greeting' || queryType === 'simple') {
-                const textContent = response.content
-                    .filter((content) => content.type === "text")
-                    .map((content) => content.text)
-                    .join("\n");
-                await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(textContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim());
-                console.log(`⚡ Fast-tracked ${queryType} query - no tool processing needed`);
-                return {
-                    response: textContent || "No response generated.",
-                    toolsUsed: [],
-                    queryType,
-                    tokensOptimized: true
-                };
-            }
-            // Continue with tool processing for business/complex queries
-            let currentMessages = [...messages];
-            let currentResponse = response;
-            const toolUsageLog = [];
-            while (true) {
-                const toolUseBlocks = currentResponse.content.filter((content) => content.type === "tool_use");
-                if (toolUseBlocks.length === 0) {
-                    // No more tool calls, return the final text response
-                    const textContent = currentResponse.content
-                        .filter((content) => content.type === "text")
-                        .map((content) => content.text)
-                        .join("\n");
-                    // Add assistant response to context (with automatic compression)
-                    const toolNames = toolUsageLog.map(t => t.name);
-                    await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(textContent || "No response generated.").replace('[DISPLAY_VERBATIM]', '').trim(), toolNames.length > 0 ? toolNames : undefined);
-                    return {
-                        response: textContent || "No response generated.",
-                        toolsUsed: toolUsageLog,
-                        queryType,
-                        tokensOptimized: true
-                    };
-                }
-                // Add the assistant's response to the conversation
-                currentMessages.push({
-                    role: "assistant",
-                    content: currentResponse.content,
-                });
-                // Process each tool use
-                const toolResults = [];
-                for (const toolUse of toolUseBlocks) {
-                    const toolName = toolUse.name;
-                    const originalArgs = toolUse.input;
-                    // Check cache first using the optimized caching system
-                    let result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
-                    if (!result || toolName === 'date-utility') { // Skip cache for date-utility
-                        // Enhance tool arguments with context using the new optimized method
-                        const enhancedArgs = await this.contextManager.enhanceToolArguments(sessionId, toolName, originalArgs || {}, query);
-                        console.log(`🧠 Context: Tool ${toolName} enhanced arguments:`, JSON.stringify(enhancedArgs, null, 2));
-                        toolUsageLog.push({ name: toolName, args: enhancedArgs });
-                        try {
-                            result = await this.mcp.callTool({
-                                name: toolName,
-                                arguments: enhancedArgs,
-                            });
-                            console.log("Tool result:", JSON.stringify(result, null, 2));
-                            // Cache the result using optimized caching (search results cache for 5 min, data for 1 hour)
-                            const cacheTime = toolName.includes('search') ? 300 :
-                                toolName === 'date-utility' ? 0 : 3600; // Don't cache date-utility
-                            if (cacheTime > 0) {
-                                await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
-                            }
-                            // Record tool usage in context with automatic compression and summarization
-                            await this.contextManager.recordToolUsage(sessionId, toolName, enhancedArgs, result);
-                        }
-                        catch (error) {
-                            const errorMessage = error instanceof Error ? error.message : String(error);
-                            console.error(`Error calling tool ${toolName}:`, error);
-                            result = {
-                                content: [{ type: "text", text: `Error: ${errorMessage}` }],
-                                isError: true
-                            };
-                        }
-                    }
-                    else {
-                        console.log(`✅ Using cached result for ${toolName}`);
-                        toolUsageLog.push({ name: toolName, args: originalArgs, cached: true });
-                    }
-                    toolResults.push({
-                        type: "tool_result",
-                        tool_use_id: toolUse.id,
-                        content: result.content || [{ type: "text", text: JSON.stringify(result) }],
-                        is_error: result.isError || false,
-                    });
-                }
-                // Add tool results to the conversation
-                currentMessages.push({
-                    role: "user",
-                    content: toolResults,
-                });
-                // Check if any tool result has DISPLAY_VERBATIM flag
-                const hasVerbatimFlag = toolResults.some(result => result.content.some((content) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")));
-                // For verbatim content, bypass Claude and return directly
-                if (hasVerbatimFlag) {
-                    const verbatimContent = toolResults
-                        .flatMap(result => result.content)
-                        .filter((content) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
-                        .map((content) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
-                        .join("\n\n");
-                    // Add assistant response to context with compression
-                    const toolNames = toolUsageLog.map(t => t.name);
-                    await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(), toolNames.length > 0 ? toolNames : undefined);
-                    return {
-                        response: verbatimContent,
-                        toolsUsed: toolUsageLog,
-                        queryType,
-                        tokensOptimized: true
-                    };
-                }
-                // Get Claude's response to the tool results
-                currentResponse = await globalRateLimiter.execute(() => RetryManager.retryWithExponentialBackoff(() => this.anthropic.messages.create({
-                    model: "claude-3-5-sonnet-20241022",
-                    max_tokens: maxTokens,
-                    system: contextualSystemPrompt,
-                    messages: currentMessages,
-                    tools: relevantTools,
-                })));
-            }
-        }
-        catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            console.error("Error processing query:", error);
-            throw new Error(`Error processing query: ${errorMessage}`);
-        }
-    }
     async cleanup() {
         try {
             if (this.transport) {
@@ -1190,19 +829,95 @@ Current conversation context:
         };
     }
 }
+// Accepts MCPBackendService instance and MCP_SERVER_PATH as arguments
+async function initializeAutoConnect(mcpServiceInstance, MCP_SERVER_PATH) {
+    try {
+        const serverPath = MCP_SERVER_PATH;
+        console.log('🔄 Attempting auto-connection to MCP server at:', serverPath);
+        // Check if file exists before attempting connection
+        try {
+            await import(pathToFileURL(serverPath).href);
+        }
+        catch (error) {
+            console.error("Dynamic import failed with error:", error);
+            throw new Error(`MCP server file not found at ${serverPath}. Please ensure the file exists and the path is correct. Original error: ${error}`);
+        }
+        await connectToServer(mcpServiceInstance, serverPath);
+        console.log('✅ Successfully auto-connected to MCP server');
+        mcpServiceInstance.autoConnectRetries = 0;
+    }
+    catch (error) {
+        mcpServiceInstance.autoConnectRetries++;
+        console.error(`❌ Auto-connection attempt ${mcpServiceInstance.autoConnectRetries} failed:`, error);
+        if (mcpServiceInstance.autoConnectRetries < mcpServiceInstance.maxAutoConnectRetries) {
+            const backoffMs = Math.min(1000 * Math.pow(2, mcpServiceInstance.autoConnectRetries), 10000);
+            console.log(`🔄 Retrying auto-connection in ${backoffMs / 1000} seconds...`);
+            setTimeout(() => initializeAutoConnect(mcpServiceInstance, MCP_SERVER_PATH), backoffMs);
+        }
+        else {
+            console.error('❌ Max auto-connection retries exceeded. Manual connection will be required.');
+        }
+    }
+}
+// Accepts MCPBackendService instance and serverScriptPath as arguments
+async function connectToServer(mcpServiceInstance, serverScriptPath) {
+    try {
+        const isJs = serverScriptPath.endsWith('.js');
+        const isPy = serverScriptPath.endsWith('.py');
+        const isTs = serverScriptPath.endsWith('.ts');
+        if (!isJs && !isPy && !isTs) {
+            throw new Error('Server script must be a .js, .ts, or .py file');
+        }
+        let command;
+        let args;
+        if (isPy) {
+            command = process.platform === 'win32' ? 'python' : 'python3';
+            args = [serverScriptPath];
+        }
+        else if (isTs) {
+            command = 'npx';
+            args = ['tsx', serverScriptPath];
+        }
+        else {
+            command = process.execPath;
+            args = [serverScriptPath];
+        }
+        mcpServiceInstance.transport = new mcpServiceInstance.StdioClientTransport({
+            command,
+            args,
+        });
+        await mcpServiceInstance.mcp.connect(mcpServiceInstance.transport);
+        const toolsResult = await mcpServiceInstance.mcp.listTools();
+        mcpServiceInstance.tools = toolsResult.tools.map((tool) => {
+            return {
+                name: tool.name,
+                description: tool.description || '',
+                input_schema: tool.inputSchema,
+            };
+        });
+        mcpServiceInstance.isConnected = true;
+        console.log('Connected to MCP server with tools:', mcpServiceInstance.tools.map(({ name }) => name).join(', '));
+        return {
+            success: true,
+            tools: mcpServiceInstance.tools.map(({ name, description }) => ({ name, description })),
+        };
+    }
+    catch (e) {
+        console.error('Failed to connect to MCP server:', e);
+        throw e;
+    }
+}
 // Create MCP service instance
 const mcpService = new MCPBackendService();
 // Store session mappings for socket connections
 const socketToSession = new Map();
 // Socket.IO connection handling
 io.on('connection', async (socket) => {
-    console.log('Client connected:', socket.id);
     // Create or retrieve session for this socket
     const sessionId = randomUUID();
     socketToSession.set(socket.id, sessionId);
     // Create session in Redis with optimized context manager
     await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
-    console.log(`✅ Created optimized session ${sessionId} for socket ${socket.id}`);
     // Send current connection status
     const connectionStatus = mcpService.getConnectionStatus();
     socket.emit('connection_status', connectionStatus);
@@ -1218,7 +933,7 @@ io.on('connection', async (socket) => {
         try {
             const { serverPath } = data;
             socket.emit('connection_progress', { status: 'connecting', message: 'Connecting to MCP server...' });
-            const result = await mcpService.connectToServer(serverPath);
+            const result = await connectToServer(mcpService, serverPath);
             socket.emit('connection_success', {
                 message: `Successfully connected to ${serverPath}`,
                 tools: result.tools
@@ -1255,37 +970,6 @@ io.on('connection', async (socket) => {
                     messageId,
                     chunk
                 });
-            });
-        }
-        catch (error) {
-            socket.emit('query_error', {
-                messageId: data.messageId,
-                message: error instanceof Error ? error.message : 'Failed to process query'
-            });
-        }
-    });
-    // KEEP: Original non-streaming handler for backward compatibility
-    socket.on('process_query', async (data) => {
-        try {
-            const { query, messageId } = data;
-            const sessionId = socketToSession.get(socket.id);
-            if (!sessionId) {
-                socket.emit('query_error', {
-                    messageId,
-                    message: 'Session not found. Please refresh the page.'
-                });
-                return;
-            }
-            socket.emit('query_progress', {
-                messageId,
-                status: 'processing',
-                message: 'Processing your query...'
-            });
-            const result = await mcpService.processQuery(query, sessionId);
-            socket.emit('query_response', {
-                messageId,
-                response: result.response,
-                toolsUsed: result.toolsUsed
             });
         }
         catch (error) {
@@ -1340,7 +1024,7 @@ app.get('/api/status', (req, res) => {
 app.post('/api/connect', async (req, res) => {
     try {
         const { serverPath } = req.body;
-        const result = await mcpService.connectToServer(serverPath);
+        const result = await connectToServer(mcpService, serverPath);
         res.json({
             success: true,
             tools: result.tools,
@@ -1394,15 +1078,30 @@ app.get('/api/query-stream', async (req, res) => {
     }
     res.end();
 });
-// KEEP: Original non-streaming query endpoint
+// REPLACE with streaming version for /api/query
 app.post('/api/query', async (req, res) => {
     try {
         const { query } = req.body;
         // Create a temporary session for REST API queries
         const tempSessionId = randomUUID();
         await mcpService['contextManager'].createSession(tempSessionId, 'rest_api_user');
-        const result = await mcpService.processQuery(query, tempSessionId);
-        res.json({ success: true, ...result });
+        let fullResponse = '';
+        let errorOccurred = false;
+        await mcpService.processQueryStream(query, tempSessionId, (chunk) => {
+            if (chunk.type === 'text_delta') {
+                fullResponse += chunk.delta;
+            }
+            else if (chunk.type === 'complete') {
+                fullResponse += chunk.response || '';
+            }
+            else if (chunk.type === 'error') {
+                errorOccurred = true;
+                res.status(500).json({ success: false, error: chunk.error });
+            }
+        });
+        if (!errorOccurred) {
+            res.json({ success: true, response: fullResponse });
+        }
     }
     catch (error) {
         res.status(500).json({
