@@ -74,7 +74,16 @@ app.get('/api/rate-limit-status', (req, res) => {
   res.json({
     rateLimit: status,
     message: `Current API usage: ${status.currentRequests}/${status.maxRequests} requests per ${status.timeWindow/1000}s window`,
-    queueLength: status.queueLength
+    queueLength: status.queueLength,
+    poolStatus: connectionPool.getPoolStatus()
+  });
+});
+
+// Add connection pool status endpoint
+app.get('/api/pool-status', (req, res) => {
+  res.json({
+    poolStatus: connectionPool.getPoolStatus(),
+    message: 'Connection pool status'
   });
 });
 
@@ -1087,38 +1096,167 @@ const mcpService = new MCPBackendService();
 // Store session mappings for socket connections
 const socketToSession = new Map<string, string>();
 
+// Connection pool for handling multiple users
+class MCPConnectionPool {
+  private pool: Map<string, MCPBackendService> = new Map();
+  private maxConnections: number = 25; // Increased for 25+ employee organizations
+  private connectionQueue: Array<{ resolve: Function, reject: Function }> = [];
+  private connectionTimeout: number = 300000; // 5 minutes timeout
+  private lastActivity: Map<string, number> = new Map();
+
+  async getConnection(sessionId: string): Promise<MCPBackendService> {
+    // Check if we already have a connection for this session
+    if (this.pool.has(sessionId)) {
+      const connection = this.pool.get(sessionId)!;
+      // Update last activity
+      this.lastActivity.set(sessionId, Date.now());
+      return connection;
+    }
+
+    // Check if we can create a new connection
+    if (this.pool.size < this.maxConnections) {
+      const connection = new MCPBackendService();
+      this.pool.set(sessionId, connection);
+      this.lastActivity.set(sessionId, Date.now());
+      return connection;
+    }
+
+    // Try to clean up inactive connections first
+    await this.cleanupInactiveConnections();
+    
+    // Check again after cleanup
+    if (this.pool.size < this.maxConnections) {
+      const connection = new MCPBackendService();
+      this.pool.set(sessionId, connection);
+      this.lastActivity.set(sessionId, Date.now());
+      return connection;
+    }
+
+    // Wait for a connection to become available
+    return new Promise((resolve, reject) => {
+      this.connectionQueue.push({ resolve, reject });
+    });
+  }
+
+  async releaseConnection(sessionId: string): Promise<void> {
+    const connection = this.pool.get(sessionId);
+    if (connection) {
+      // Clean up the connection
+      await connection.cleanup();
+      this.pool.delete(sessionId);
+      this.lastActivity.delete(sessionId);
+      
+      // Process queued requests
+      if (this.connectionQueue.length > 0) {
+        const nextRequest = this.connectionQueue.shift();
+        if (nextRequest) {
+          const newConnection = new MCPBackendService();
+          this.pool.set(sessionId, newConnection);
+          this.lastActivity.set(sessionId, Date.now());
+          nextRequest.resolve(newConnection);
+        }
+      }
+    }
+  }
+
+  private async cleanupInactiveConnections(): Promise<void> {
+    const now = Date.now();
+    const inactiveSessions: string[] = [];
+
+    // Find inactive connections
+    for (const [sessionId, lastActivity] of this.lastActivity.entries()) {
+      if (now - lastActivity > this.connectionTimeout) {
+        inactiveSessions.push(sessionId);
+      }
+    }
+
+    // Clean up inactive connections
+    for (const sessionId of inactiveSessions) {
+      await this.releaseConnection(sessionId);
+    }
+
+    if (inactiveSessions.length > 0) {
+      console.log(`🧹 Cleaned up ${inactiveSessions.length} inactive connections`);
+    }
+  }
+
+  getPoolStatus() {
+    return {
+      activeConnections: this.pool.size,
+      maxConnections: this.maxConnections,
+      queuedRequests: this.connectionQueue.length,
+      inactiveConnections: Array.from(this.lastActivity.entries())
+        .filter(([_, lastActivity]) => Date.now() - lastActivity > this.connectionTimeout).length
+    };
+  }
+}
+
+const connectionPool = new MCPConnectionPool();
+
+// Periodic cleanup of inactive connections (every 2 minutes)
+setInterval(async () => {
+  try {
+    await connectionPool['cleanupInactiveConnections']();
+  } catch (error) {
+    console.error('Error during periodic connection cleanup:', error);
+  }
+}, 120000); // 2 minutes
+
 // Socket.IO connection handling
 io.on('connection', async (socket) => {  
   // Create or retrieve session for this socket
   const sessionId = randomUUID();
   socketToSession.set(socket.id, sessionId);
   
-  // Create session in Redis with optimized context manager
-  await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
-  // Send current connection status
-  const connectionStatus = mcpService.getConnectionStatus();
-  socket.emit('connection_status', connectionStatus);
-  
-  // If already connected via auto-connect, send success message
-  if (connectionStatus.isConnected) {
-    socket.emit('connection_success', {
-      message: 'Connected to MCP server',
-      tools: connectionStatus.tools
+  try {
+    // Get connection for this session
+    const mcpService = await connectionPool.getConnection(sessionId);
+    
+    // Create session in Redis with optimized context manager
+    await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
+    
+    // Send current connection status
+    const connectionStatus = mcpService.getConnectionStatus();
+    socket.emit('connection_status', connectionStatus);
+    
+    // If already connected via auto-connect, send success message
+    if (connectionStatus.isConnected) {
+      socket.emit('connection_success', {
+        message: 'Connected to MCP server',
+        tools: connectionStatus.tools
+      });
+    }
+
+  } catch (error) {
+    console.error('Error setting up socket connection:', error);
+    socket.emit('connection_error', {
+      message: error instanceof Error ? error.message : 'Failed to setup connection'
     });
   }
 
   // Keep manual connection handler for fallback/reconnection
   socket.on('connect_server', async (data) => {
     try {
+      const sessionId = socketToSession.get(socket.id);
+      if (!sessionId) {
+        socket.emit('connection_error', { message: 'Session not found' });
+        return;
+      }
+
       const { serverPath } = data;
       socket.emit('connection_progress', { status: 'connecting', message: 'Connecting to MCP server...' });
+      
+      const mcpService = await connectionPool.getConnection(sessionId);
       const result = await connectToServer(mcpService, serverPath);
+      
       socket.emit('connection_success', {
         message: `Successfully connected to ${serverPath}`,
         tools: result.tools
       });
+      
       // Broadcast to all clients that server is connected
-      io.emit('connection_status', mcpService.getConnectionStatus());
+      const connectionStatus = mcpService.getConnectionStatus();
+      io.emit('connection_status', connectionStatus);
     } catch (error) {
       socket.emit('connection_error', {
         message: error instanceof Error ? error.message : 'Failed to connect to server'
@@ -1146,6 +1284,9 @@ io.on('connection', async (socket) => {
         message: 'Processing your query...' 
       });
       
+      // Get connection for this session
+      const mcpService = await connectionPool.getConnection(sessionId);
+      
       // Use streaming version
       await mcpService.processQueryStream(query, sessionId, (chunk) => {
         socket.emit('query_stream', {
@@ -1171,7 +1312,9 @@ io.on('connection', async (socket) => {
         return;
       }
       
+      const mcpService = await connectionPool.getConnection(sessionId);
       const context = await mcpService['contextManager'].getSession(sessionId);
+      
       socket.emit('context_response', {
         messages: context?.messages || [],
         toolUsage: context?.toolUsageHistory || [],
@@ -1192,18 +1335,30 @@ io.on('connection', async (socket) => {
     if (sessionId) {
       console.log(`🧹 Cleaned up session ${sessionId} for socket ${socket.id}`);
       socketToSession.delete(socket.id);
+      await connectionPool.releaseConnection(sessionId);
     }
   });
 });
 
 // REST API endpoints (alternative to WebSocket)
-app.get('/api/status', (req, res) => {
-  const status = mcpService.getConnectionStatus();
-  res.json({
-    ...status,
-    autoConnectRetries: mcpService['autoConnectRetries'],
-    maxAutoConnectRetries: mcpService['maxAutoConnectRetries']
-  });
+app.get('/api/status', async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId as string || randomUUID();
+    const mcpService = await connectionPool.getConnection(sessionId);
+    const status = mcpService.getConnectionStatus();
+    
+    res.json({
+      ...status,
+      autoConnectRetries: mcpService['autoConnectRetries'],
+      maxAutoConnectRetries: mcpService['maxAutoConnectRetries'],
+      poolStatus: connectionPool.getPoolStatus()
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to get status',
+      poolStatus: connectionPool.getPoolStatus()
+    });
+  }
 });
 
 // Conversation API endpoints
@@ -1247,31 +1402,47 @@ app.delete('/api/conversations', async (req, res) => {
 // Keep manual connect endpoint for fallback/reconnection
 app.post('/api/connect', async (req, res) => {
   try {
-    const { serverPath } = req.body;
+    const { serverPath, sessionId } = req.body;
+    const tempSessionId = sessionId || randomUUID();
+    const mcpService = await connectionPool.getConnection(tempSessionId);
     const result = await connectToServer(mcpService, serverPath);
+    
     res.json({ 
       success: true, 
       tools: result.tools,
-      message: 'Manual connection successful'
+      message: 'Manual connection successful',
+      sessionId: tempSessionId
     });
   } catch (error) {
     res.status(500).json({ 
       success: false, 
       error: error instanceof Error ? error.message : 'Connection failed',
-      autoConnectRetries: mcpService['autoConnectRetries']
+      poolStatus: connectionPool.getPoolStatus()
     });
   }
 });
 
 // Add health check endpoint
-app.get('/api/health', (req, res) => {
-  const status = mcpService.getConnectionStatus();
-  res.json({
-    status: status.isConnected ? 'healthy' : 'unhealthy',
-    connected: status.isConnected,
-    tools: status.tools,
-    autoConnectRetries: mcpService['autoConnectRetries']
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    const sessionId = req.query.sessionId as string || randomUUID();
+    const mcpService = await connectionPool.getConnection(sessionId);
+    const status = mcpService.getConnectionStatus();
+    
+    res.json({
+      status: status.isConnected ? 'healthy' : 'unhealthy',
+      connected: status.isConnected,
+      tools: status.tools,
+      autoConnectRetries: mcpService['autoConnectRetries'],
+      poolStatus: connectionPool.getPoolStatus()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'unhealthy',
+      error: error instanceof Error ? error.message : 'Health check failed',
+      poolStatus: connectionPool.getPoolStatus()
+    });
+  }
 });
 
 // NEW: Server-Sent Events endpoint for streaming
@@ -1292,9 +1463,11 @@ app.get('/api/query-stream', async (req, res) => {
   });
   
   const tempSessionId = randomUUID();
-  await mcpService['contextManager'].createSession(tempSessionId, 'sse_user');
   
   try {
+    const mcpService = await connectionPool.getConnection(tempSessionId);
+    await mcpService['contextManager'].createSession(tempSessionId, 'sse_user');
+    
     await mcpService.processQueryStream(query, tempSessionId, (chunk) => {
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     });
@@ -1303,20 +1476,26 @@ app.get('/api/query-stream', async (req, res) => {
       type: 'error', 
       error: error instanceof Error ? error.message : 'Unknown error' 
     })}\n\n`);
+  } finally {
+    // Clean up the connection
+    await connectionPool.releaseConnection(tempSessionId);
+    res.end();
   }
-  
-  res.end();
 });
 
 // REPLACE with streaming version for /api/query
 app.post('/api/query', async (req, res) => {
+  const tempSessionId = randomUUID();
+  
   try {
     const { query } = req.body;
     // Create a temporary session for REST API queries
-    const tempSessionId = randomUUID();
+    const mcpService = await connectionPool.getConnection(tempSessionId);
     await mcpService['contextManager'].createSession(tempSessionId, 'rest_api_user');
+    
     let fullResponse = '';
     let errorOccurred = false;
+    
     await mcpService.processQueryStream(query, tempSessionId, (chunk) => {
       if (chunk.type === 'text_delta') {
         fullResponse += chunk.delta;
@@ -1327,6 +1506,7 @@ app.post('/api/query', async (req, res) => {
         res.status(500).json({ success: false, error: chunk.error });
       }
     });
+    
     if (!errorOccurred) {
       res.json({ success: true, response: fullResponse });
     }
@@ -1335,13 +1515,18 @@ app.post('/api/query', async (req, res) => {
       success: false, 
       error: error instanceof Error ? error.message : 'Query processing failed' 
     });
+  } finally {
+    // Clean up the connection
+    await connectionPool.releaseConnection(tempSessionId);
   }
 });
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
   console.log('\nShutting down gracefully...');
-  await mcpService.cleanup();
+  // Clean up all connections in the pool
+  const poolStatus = connectionPool.getPoolStatus();
+  console.log(`Cleaning up ${poolStatus.activeConnections} active connections...`);
   httpServer.close(() => {
     console.log('Server closed');
     process.exit(0);
@@ -1350,7 +1535,9 @@ process.on('SIGINT', async () => {
 
 process.on('SIGTERM', async () => {
   console.log('\nShutting down gracefully...');
-  await mcpService.cleanup();
+  // Clean up all connections in the pool
+  const poolStatus = connectionPool.getPoolStatus();
+  console.log(`Cleaning up ${poolStatus.activeConnections} active connections...`);
   httpServer.close(() => {
     console.log('Server closed');
     process.exit(0);
