@@ -1357,8 +1357,8 @@ process.on('SIGTERM', async () => {
   });
 });
 
-const PORT = process.env.PORT || 8080;
-httpServer.listen(PORT, () => {
+const PORT = parseInt(process.env.PORT || '8080', 10);
+httpServer.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 MCP Backend Service running on port ${PORT}`);
   console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
   console.log(`🔗 REST API endpoint: http://localhost:${PORT}/api`);
