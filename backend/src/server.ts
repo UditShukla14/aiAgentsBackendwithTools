@@ -55,15 +55,18 @@ const io = new SocketIOServer(httpServer, {
   path: "/socket.io",
   cors: {
     origin: allowedOrigins,
-    methods: ["GET", "POST"],
-    credentials: true
+    methods: ["GET", "POST", "OPTIONS"],
+    credentials: true,
+    allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"]
   }
 });
 
 app.use(cors({
   origin: allowedOrigins,
   methods: ["GET", "POST", "DELETE", "OPTIONS"],
-  credentials: true
+  credentials: true,
+  allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"],
+  exposedHeaders: ["Content-Length", "Content-Range"]
 }));
 
 app.use(express.json());
