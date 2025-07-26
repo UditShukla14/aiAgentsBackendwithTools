@@ -15,6 +15,7 @@ import { SYSTEM_PROMPT } from './resources/prompts.js';
 import { allowedOrigins } from './resources/staticData.js';
 import { filterInternalIds, classifyQuery, getSystemPrompt, getMaxTokens } from "./server-util.js";
 import { pathToFileURL } from 'url';
+import { saveConversation, getConversations, deleteConversation } from './conversation-db.js';
 
 dotenv.config();
 
@@ -61,7 +62,7 @@ const io = new SocketIOServer(httpServer, {
 
 app.use(cors({
   origin: allowedOrigins,
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "DELETE", "OPTIONS"],
   credentials: true
 }));
 
@@ -1203,6 +1204,44 @@ app.get('/api/status', (req, res) => {
     autoConnectRetries: mcpService['autoConnectRetries'],
     maxAutoConnectRetries: mcpService['maxAutoConnectRetries']
   });
+});
+
+// Conversation API endpoints
+app.get('/api/conversations', async (req, res) => {
+  try {
+    const userId = req.query.userId as string;
+    if (!userId) return res.status(400).json({ error: 'Missing userId' });
+    const conversations = await getConversations(userId);
+    res.json({ conversations });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch conversations' });
+  }
+});
+
+app.post('/api/conversations', async (req, res) => {
+  try {
+    const { userId, sessionId, messages } = req.body;
+    if (!userId || !sessionId || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'Missing userId, sessionId, or messages' });
+    }
+    await saveConversation(userId, sessionId, messages);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save conversation' });
+  }
+});
+
+app.delete('/api/conversations', async (req, res) => {
+  try {
+    const { userId, sessionId } = req.body;
+    if (!userId || !sessionId) {
+      return res.status(400).json({ error: 'Missing userId or sessionId' });
+    }
+    await deleteConversation(userId, sessionId);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete conversation' });
+  }
 });
 
 // Keep manual connect endpoint for fallback/reconnection
