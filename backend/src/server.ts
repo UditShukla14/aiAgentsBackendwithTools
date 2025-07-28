@@ -90,6 +90,15 @@ app.get('/api/pool-status', (req, res) => {
   });
 });
 
+// Add socket connection test endpoint
+app.get('/api/socket-test', (req, res) => {
+  res.json({
+    socketConnections: io.engine.clientsCount,
+    sessions: socketToSession.size,
+    message: 'Socket.IO status'
+  });
+});
+
 interface AnthropicTool {
   name: string;
   description: string;
@@ -1207,31 +1216,45 @@ setInterval(async () => {
 
 // Socket.IO connection handling
 io.on('connection', async (socket) => {  
+  console.log(`🔌 New socket connection: ${socket.id}`);
+  
   // Create or retrieve session for this socket
   const sessionId = randomUUID();
   socketToSession.set(socket.id, sessionId);
   
   try {
+    console.log(`📋 Setting up session: ${sessionId} for socket: ${socket.id}`);
+    
     // Get connection for this session
     const mcpService = await connectionPool.getConnection(sessionId);
+    console.log(`✅ Got MCP service for session: ${sessionId}`);
     
     // Create session in Redis with optimized context manager
     await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
+    console.log(`✅ Created Redis session for: ${sessionId}`);
     
     // Send current connection status
     const connectionStatus = mcpService.getConnectionStatus();
+    console.log(`📊 Connection status for ${sessionId}:`, connectionStatus);
     socket.emit('connection_status', connectionStatus);
     
     // If already connected via auto-connect, send success message
     if (connectionStatus.isConnected) {
+      console.log(`🎉 MCP server connected for session: ${sessionId}`);
       socket.emit('connection_success', {
         message: 'Connected to MCP server',
         tools: connectionStatus.tools
       });
+    } else {
+      console.log(`⏳ MCP server not yet connected for session: ${sessionId}`);
+      socket.emit('connection_pending', {
+        message: 'Connecting to MCP server...',
+        autoConnectRetries: mcpService['autoConnectRetries']
+      });
     }
 
   } catch (error) {
-    console.error('Error setting up socket connection:', error);
+    console.error(`❌ Error setting up socket connection for ${sessionId}:`, error);
     socket.emit('connection_error', {
       message: error instanceof Error ? error.message : 'Failed to setup connection'
     });

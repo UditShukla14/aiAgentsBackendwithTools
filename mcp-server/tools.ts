@@ -2,6 +2,506 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
+// Shared utility functions (used by multiple tools)
+export const SHARED_UTILITIES = {
+  // Date utility functions
+  date: {
+    addDays: (date: Date, days: number): Date => {
+      const result = new Date(date);
+      result.setDate(result.getDate() + days);
+      return result;
+    },
+    
+    addMonths: (date: Date, months: number): Date => {
+      const result = new Date(date);
+      result.setMonth(result.getMonth() + months);
+      return result;
+    },
+    
+    getWeekStart: (date: Date): Date => {
+      const result = new Date(date);
+      const day = result.getDay();
+      const diff = result.getDate() - day + (day === 0 ? -6 : 1); // Monday as first day
+      result.setDate(diff);
+      return result;
+    },
+    
+    getWeekEnd: (date: Date): Date => {
+      const start = SHARED_UTILITIES.date.getWeekStart(date);
+      return SHARED_UTILITIES.date.addDays(start, 6);
+    },
+    
+    getCurrentQuarter: (date: Date): number => {
+      return Math.floor(date.getMonth() / 3) + 1;
+    },
+    
+    getQuarterRange: (year: number, quarter: number) => {
+      const startMonth = (quarter - 1) * 3;
+      return {
+        start: new Date(year, startMonth, 1),
+        end: new Date(year, startMonth + 3, 0)
+      };
+    },
+    
+    getLastQuarterRange: (date: Date) => {
+      const currentQuarter = SHARED_UTILITIES.date.getCurrentQuarter(date);
+      const lastQuarter = currentQuarter === 1 ? 4 : currentQuarter - 1;
+      const year = currentQuarter === 1 ? date.getFullYear() - 1 : date.getFullYear();
+      return SHARED_UTILITIES.date.getQuarterRange(year, lastQuarter);
+    },
+    
+    getNextQuarterRange: (date: Date) => {
+      const currentQuarter = SHARED_UTILITIES.date.getCurrentQuarter(date);
+      const nextQuarter = currentQuarter === 4 ? 1 : currentQuarter + 1;
+      const year = currentQuarter === 4 ? date.getFullYear() + 1 : date.getFullYear();
+      return SHARED_UTILITIES.date.getQuarterRange(year, nextQuarter);
+    },
+    
+    extractNumber: (str: string): number | null => {
+      const match = str.match(/\d+/);
+      return match ? parseInt(match[0]) : null;
+    },
+    
+    formatDate: (date: Date, formatStr?: string): string => {
+      if (!formatStr || formatStr === 'ISO') {
+        return date.toISOString().split('T')[0];
+      }
+      
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      
+      return formatStr
+        .replace('YYYY', String(year))
+        .replace('MM', month)
+        .replace('DD', day);
+    },
+    
+    parseNaturalLanguageDate: (dateExpression: string): { start: string, end: string } | null => {
+      if (!dateExpression) return null;
+      
+      const now = new Date();
+      const currentYear = now.getFullYear();
+      const currentMonth = now.getMonth();
+      
+      // Normalize the expression
+      const expr = dateExpression.toLowerCase().trim();
+      
+      // Create a structured interpretation based on common patterns
+      const dateInterpretation: Record<string, { start: Date, end: Date }> = {
+        // Relative time expressions
+        'today': { start: now, end: now },
+        'yesterday': { 
+          start: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1),
+          end: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+        },
+        'tomorrow': { 
+          start: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1),
+          end: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)
+        },
+        
+        // Week expressions
+        'this week': {
+          start: SHARED_UTILITIES.date.getWeekStart(now),
+          end: SHARED_UTILITIES.date.getWeekEnd(now)
+        },
+        'last week': {
+          start: SHARED_UTILITIES.date.getWeekStart(SHARED_UTILITIES.date.addDays(now, -7)),
+          end: SHARED_UTILITIES.date.getWeekEnd(SHARED_UTILITIES.date.addDays(now, -7))
+        },
+        'next week': {
+          start: SHARED_UTILITIES.date.getWeekStart(SHARED_UTILITIES.date.addDays(now, 7)),
+          end: SHARED_UTILITIES.date.getWeekEnd(SHARED_UTILITIES.date.addDays(now, 7))
+        },
+        
+        // Month expressions
+        'this month': {
+          start: new Date(currentYear, currentMonth, 1),
+          end: new Date(currentYear, currentMonth + 1, 0)
+        },
+        'last month': {
+          start: new Date(currentYear, currentMonth - 1, 1),
+          end: new Date(currentYear, currentMonth, 0)
+        },
+        'next month': {
+          start: new Date(currentYear, currentMonth + 1, 1),
+          end: new Date(currentYear, currentMonth + 2, 0)
+        },
+        
+        // Quarter expressions
+        'this quarter': SHARED_UTILITIES.date.getQuarterRange(currentYear, SHARED_UTILITIES.date.getCurrentQuarter(now)),
+        'last quarter': SHARED_UTILITIES.date.getLastQuarterRange(now),
+        'next quarter': SHARED_UTILITIES.date.getNextQuarterRange(now),
+        
+        // Year expressions
+        'this year': {
+          start: new Date(currentYear, 0, 1),
+          end: new Date(currentYear, 11, 31)
+        },
+        'last year': {
+          start: new Date(currentYear - 1, 0, 1),
+          end: new Date(currentYear - 1, 11, 31)
+        },
+        'next year': {
+          start: new Date(currentYear + 1, 0, 1),
+          end: new Date(currentYear + 1, 11, 31)
+        }
+      };
+      
+      // Check for exact matches first
+      if (expr in dateInterpretation) {
+        const range = dateInterpretation[expr];
+        return {
+          start: SHARED_UTILITIES.date.formatDate(range.start),
+          end: SHARED_UTILITIES.date.formatDate(range.end)
+        };
+      }
+      
+      // Handle "last X days/weeks/months" patterns
+      if (expr.includes('last') && expr.includes('days')) {
+        const days = SHARED_UTILITIES.date.extractNumber(expr) || 30;
+        return {
+          start: SHARED_UTILITIES.date.formatDate(SHARED_UTILITIES.date.addDays(now, -days)),
+          end: SHARED_UTILITIES.date.formatDate(now)
+        };
+      }
+      
+      if (expr.includes('last') && expr.includes('weeks')) {
+        const weeks = SHARED_UTILITIES.date.extractNumber(expr) || 1;
+        return {
+          start: SHARED_UTILITIES.date.formatDate(SHARED_UTILITIES.date.addDays(now, -weeks * 7)),
+          end: SHARED_UTILITIES.date.formatDate(now)
+        };
+      }
+      
+      if (expr.includes('last') && expr.includes('months')) {
+        const months = SHARED_UTILITIES.date.extractNumber(expr) || 1;
+        return {
+          start: SHARED_UTILITIES.date.formatDate(SHARED_UTILITIES.date.addMonths(now, -months)),
+          end: SHARED_UTILITIES.date.formatDate(now)
+        };
+      }
+      
+      // Handle "next X days/weeks/months" patterns
+      if (expr.includes('next') && expr.includes('days')) {
+        const days = SHARED_UTILITIES.date.extractNumber(expr) || 30;
+        return {
+          start: SHARED_UTILITIES.date.formatDate(now),
+          end: SHARED_UTILITIES.date.formatDate(SHARED_UTILITIES.date.addDays(now, days))
+        };
+      }
+      
+      // Handle quarter expressions like "Q1 2025"
+      const quarterMatch = expr.match(/q([1-4])\s*(\d{4})/);
+      if (quarterMatch) {
+        const quarter = parseInt(quarterMatch[1]);
+        const year = parseInt(quarterMatch[2]);
+        const range = SHARED_UTILITIES.date.getQuarterRange(year, quarter);
+        return {
+          start: SHARED_UTILITIES.date.formatDate(range.start),
+          end: SHARED_UTILITIES.date.formatDate(range.end)
+        };
+      }
+      
+      // Handle year expressions like "2024"
+      const yearMatch = expr.match(/^(\d{4})$/);
+      if (yearMatch) {
+        const year = parseInt(yearMatch[1]);
+        return {
+          start: SHARED_UTILITIES.date.formatDate(new Date(year, 0, 1)),
+          end: SHARED_UTILITIES.date.formatDate(new Date(year, 11, 31))
+        };
+      }
+      
+      // Try to parse as a regular date
+      const singleDate = new Date(dateExpression);
+      if (!isNaN(singleDate.getTime())) {
+        const dateStr = SHARED_UTILITIES.date.formatDate(singleDate);
+        return { start: dateStr, end: dateStr };
+      }
+      
+      return null;
+    }
+  },
+  
+  // Comprehensive API utilities (shared between all tools)
+  api: {
+    // Customer-related APIs
+    customers: {
+      // Get customer list with search and filters
+      getList: async (params: {
+        search?: string;
+        take?: number;
+        skip?: number;
+        status?: string;
+      } = {}) => {
+        return await callIMPApi("/api/customer_list", {
+          take: params.take || 1000,
+          ...(params.search && { search: params.search }),
+          ...(params.skip && { skip: params.skip }),
+          ...(params.status && { status: params.status })
+        });
+      },
+      
+      // Get customer details by ID
+      getDetails: async (customerId: string | number) => {
+        return await callIMPApi("/api/customer_details", {
+          customer_id: customerId
+        });
+      },
+      
+      // Search customers by name or other criteria
+      search: async (searchTerm: string, take: number = 1000) => {
+        return await callIMPApi("/api/customer_list", {
+          search: searchTerm,
+          take
+        });
+      }
+    },
+    
+    // Estimate-related APIs
+    estimates: {
+      // Get estimate list with comprehensive filters
+      getList: async (params: {
+        search?: string;
+        from_date?: string;
+        to_date?: string;
+        take?: number;
+        skip?: number;
+        status?: string;
+        customer_id?: string | number;
+      } = {}) => {
+        return await callIMPApi("/api/estimate/list", {
+          take: params.take || 1000,
+          ...(params.search && { search: params.search }),
+          ...(params.from_date && { from_date: params.from_date }),
+          ...(params.to_date && { to_date: params.to_date }),
+          ...(params.skip && { skip: params.skip }),
+          ...(params.status && { status: params.status }),
+          ...(params.customer_id && { customer_id: params.customer_id })
+        });
+      },
+      
+      // Get estimate details by ID
+      getDetails: async (estimateId: string | number) => {
+        return await callIMPApi("/api/estimate_details", {
+          estimate_id: estimateId
+        });
+      },
+      
+      // Search estimates by customer name or other criteria
+      search: async (searchTerm: string, params: {
+        from_date?: string;
+        to_date?: string;
+        take?: number;
+      } = {}) => {
+        return await callIMPApi("/api/estimate/list", {
+          search: searchTerm,
+          take: params.take || 1000,
+          ...(params.from_date && { from_date: params.from_date }),
+          ...(params.to_date && { to_date: params.to_date })
+        });
+      }
+    },
+    
+    // Invoice-related APIs
+    invoices: {
+      // Get invoice list with comprehensive filters
+      getList: async (params: {
+        search?: string;
+        from_date?: string;
+        to_date?: string;
+        take?: number;
+        skip?: number;
+        status?: string;
+        customer_id?: string | number;
+        get_all?: boolean;
+      } = {}) => {
+        return await callIMPApi("/api/invoice_list", {
+          take: params.take || 1000,
+          ...(params.search && { search: params.search }),
+          ...(params.from_date && { from_date: params.from_date }),
+          ...(params.to_date && { to_date: params.to_date }),
+          ...(params.skip && { skip: params.skip }),
+          ...(params.status && { status: params.status }),
+          ...(params.customer_id && { customer_id: params.customer_id }),
+          ...(params.get_all && { get_all: params.get_all })
+        });
+      },
+      
+      // Get invoice details by ID
+      getDetails: async (invoiceId: string | number) => {
+        return await callIMPApi("/api/invoice_details", {
+          invoice_id: invoiceId
+        });
+      },
+      
+      // Search invoices by customer name or other criteria
+      search: async (searchTerm: string, params: {
+        from_date?: string;
+        to_date?: string;
+        take?: number;
+      } = {}) => {
+        return await callIMPApi("/api/invoice_list", {
+          search: searchTerm,
+          take: params.take || 1000,
+          ...(params.from_date && { from_date: params.from_date }),
+          ...(params.to_date && { to_date: params.to_date })
+        });
+      }
+    },
+    
+    // Task-related APIs
+    tasks: {
+      // Get task list with comprehensive filters
+      getList: async (params: {
+        object_name?: string;
+        object_id?: string | number;
+        filter?: string;
+        page?: number;
+        take?: number;
+        search?: string;
+        employee_name?: string;
+        show_all?: boolean;
+      } = {}) => {
+        return await callIMPApi("/api/task_list", {
+          take: params.take || 20,
+          ...(params.object_name && { object_name: params.object_name }),
+          ...(params.object_id && { object_id: params.object_id }),
+          ...(params.filter && { filter: params.filter }),
+          ...(params.page && { page: params.page }),
+          ...(params.search && { search: params.search }),
+          ...(params.show_all && { show_all: params.show_all })
+        });
+      },
+      
+      // Get task details by ID
+      getDetails: async (taskId: string | number) => {
+        return await callIMPApi("/api/task_details", {
+          task_id: taskId
+        });
+      },
+      
+      // Get task details by custom number
+      getDetailsByCustomNumber: async (customNumber: string) => {
+        return await callIMPApi("/api/task_details", {
+          custom_number: customNumber
+        });
+      }
+    },
+    
+    // Product-related APIs
+    products: {
+      // Get product list with search and filters
+      getList: async (params: {
+        search?: string;
+        take?: number;
+        skip?: number;
+        category?: string;
+        status?: string;
+      } = {}) => {
+        return await callIMPApi("/api/product_list", {
+          take: params.take || 1000,
+          ...(params.search && { search: params.search }),
+          ...(params.skip && { skip: params.skip }),
+          ...(params.category && { category: params.category }),
+          ...(params.status && { status: params.status })
+        });
+      },
+      
+      // Get product details by ID
+      getDetails: async (productId: string | number) => {
+        return await callIMPApi("/api/product_details", {
+          product_id: productId
+        });
+      },
+      
+      // Search products by name or other criteria
+      search: async (searchTerm: string, take: number = 1000) => {
+        return await callIMPApi("/api/product_list", {
+          search: searchTerm,
+          take
+        });
+      }
+    },
+    
+    // Employee-related APIs
+    employees: {
+      // Get employee list
+      getList: async (params: {
+        search?: string;
+        take?: number;
+        skip?: number;
+        role?: string;
+      } = {}) => {
+        return await callIMPApi("/api/employee_list", {
+          take: params.take || 1000,
+          ...(params.search && { search: params.search }),
+          ...(params.skip && { skip: params.skip }),
+          ...(params.role && { role: params.role })
+        });
+      },
+      
+      // Get employee details by ID
+      getDetails: async (employeeId: string | number) => {
+        return await callIMPApi("/api/employee_details", {
+          employee_id: employeeId
+        });
+      }
+    },
+    
+    // Analytics and reporting APIs
+    analytics: {
+      // Get sales analytics data
+      getSalesData: async (params: {
+        from_date?: string;
+        to_date?: string;
+        customer_id?: string | number;
+        include_estimates?: boolean;
+        include_invoices?: boolean;
+      } = {}) => {
+        return await callIMPApi("/api/analytics/sales", {
+          ...(params.from_date && { from_date: params.from_date }),
+          ...(params.to_date && { to_date: params.to_date }),
+          ...(params.customer_id && { customer_id: params.customer_id }),
+          ...(params.include_estimates && { include_estimates: params.include_estimates }),
+          ...(params.include_invoices && { include_invoices: params.include_invoices })
+        });
+      },
+      
+      // Get customer analytics data
+      getCustomerData: async (customerId: string | number, params: {
+        from_date?: string;
+        to_date?: string;
+      } = {}) => {
+        return await callIMPApi("/api/analytics/customer", {
+          customer_id: customerId,
+          ...(params.from_date && { from_date: params.from_date }),
+          ...(params.to_date && { to_date: params.to_date })
+        });
+      }
+    },
+    
+    // Utility APIs
+    utils: {
+      // Get company information
+      getCompanyInfo: async () => {
+        return await callIMPApi("/api/company_info");
+      },
+      
+      // Get user information
+      getUserInfo: async () => {
+        return await callIMPApi("/api/user_info");
+      },
+      
+      // Get system status
+      getSystemStatus: async () => {
+        return await callIMPApi("/api/system_status");
+      }
+    }
+  }
+};
+
 // Static data for MCP server tools
 
 export const BASE_URL = "https://invoicemakerpro.com";
@@ -640,12 +1140,12 @@ export function registerBusinessTools(server: McpServer) {
           cleanToDate = toValidation.parsedDate!.toISOString().split('T')[0];
         }
   
-        const data = await callIMPApi("/api/estimate/list", {
-          ...(cleanFromDate && { from_date: cleanFromDate }),
-          ...(cleanToDate && { to_date: cleanToDate }),
-          ...(search && { search }),
+        const data = await SHARED_UTILITIES.api.estimates.getList({
+          from_date: cleanFromDate,
+          to_date: cleanToDate,
+          search,
           take,
-          ...(skip && { skip })
+          skip
         });
   
         if (!data.success) {
@@ -771,7 +1271,7 @@ export function registerBusinessTools(server: McpServer) {
           ...(skip && { skip })
         };
   
-        const data = await callIMPApi("/api/invoice_list", params);
+        const data = await SHARED_UTILITIES.api.invoices.getList(params);
   
         if (!data.success) {
           return { content: [{ type: "text", text: `Error fetching invoices: ${data.message}` }] };
@@ -860,10 +1360,10 @@ export function registerBusinessTools(server: McpServer) {
     },
     async ({ search, take = 25, skip }) => {
       try {
-        const data = await callIMPApi("/api/customer_list", {
-          ...(search && { search }),
+        const data = await SHARED_UTILITIES.api.customers.getList({
+          search,
           take,
-          ...(skip && { skip })
+          skip
         });
   
         if (!data.success) {
@@ -1596,35 +2096,19 @@ export function registerBusinessTools(server: McpServer) {
           package_list: event.package_list
         }));
   
-        // Build a human-readable summary
-        let summary = `[DISPLAY_VERBATIM] Delivery Board (${params.from_date} to ${params.to_date}):\n`;
-        if (formatted.length === 0) {
-          summary += 'No deliveries scheduled for this period.';
-        } else {
-          formatted.forEach((event: typeof formatted[0], idx: number) => {
-            summary += `\n${idx + 1}. ${event.type === 'estimate' ? 'Estimate' : 'Delivery'} scheduled for ${event.delivery_date}`;
-            if (event.job_name) summary += `\n   - Job: ${event.job_name}`;
-            if (event.job_location) summary += `\n   - Location: ${event.job_location}`;
-            if (event.ext_po_number) summary += `\n   - PO Number: ${event.ext_po_number}`;
-            if (event.grand_total) summary += `\n   - Amount: $${Number(event.grand_total).toLocaleString()}`;
-            if (event.customer && event.customer.name) summary += `\n   - Customer: ${event.customer.name}`;
-            summary += `\n   - Delivered: ${event.is_delivered === '1' ? 'Yes' : 'No'}`;
-            if (event.package_list) summary += `\n   - 📦 Packing List: ${event.package_list}`;
-          });
-        }
-  
+      
+        // Return a single JSON object with formatted and raw data (no summary field)
         return {
           content: [
             {
               type: "text",
-              text: summary
-            },
-            {
-              type: "text",
               text: JSON.stringify({
-                date_range: { from: params.from_date, to: params.to_date },
-                total_events: formatted.length,
-                events: formatted
+                formatted: {
+                  date_range: { from: params.from_date, to: params.to_date },
+                  total_events: formatted.length,
+                  events: formatted
+                },
+                raw: data
               }, null, 2)
             }
           ]
@@ -1635,22 +2119,345 @@ export function registerBusinessTools(server: McpServer) {
     }
   );
 
-  
+  // get task list tool
+  server.tool(
+    "getTaskList",
+    "Get a list of tasks with optional filtering and pagination parameters. Use employee_name to filter tasks assigned to a specific employee (client-side filtering from all company tasks). For large datasets, use pagination to avoid response size limits.",
+    {
+      object_name: z.string().optional().describe("Object name for filtering"),
+      object_id: z.string().optional().describe("Object ID for filtering"),
+      filter: z.string().optional().describe("Filter criteria"),
+      employee_name: z.string().optional().describe("Employee name to filter tasks assigned to specific employee"),
+      page: z.number().optional().describe("Page number for pagination (default: 1)"),
+      take: z.number().optional().describe("Number of records to take per page (default: 20 for better performance)"),
+      search: z.string().optional().describe("Search term to filter tasks"),
+      show_all: z.boolean().optional().describe("Whether to show all results (may cause large responses)")
+    },
+    async ({ object_name, object_id, filter, employee_name, page = 1, take = 20, search, show_all = false }) => {
+      try {
+        const params: Record<string, any> = {
+          page,
+          take
+        };
+
+        // Add optional parameters if provided
+        if (object_name) params.object_name = object_name;
+        if (object_id) params.object_id = object_id;
+        if (filter) params.filter = filter;
+        if (employee_name) params.employee_name = employee_name;
+        if (search) params.search = search;
+
+        // Handle pagination and data fetching
+        let allTasks: any[] = [];
+        let totalPages = 1;
+        let totalRecords = 0;
+        
+        if (show_all && employee_name) {
+          // Fetch all pages to get complete results for employee filtering
+          let currentPage = 1;
+          let hasMorePages = true;
+          
+          while (hasMorePages) {
+            const pageParams = { ...params, page: currentPage, take: 100 };
+            const pageData = await SHARED_UTILITIES.api.tasks.getList(pageParams);
+            
+            if (!pageData.success) {
+              return { content: [{ type: "text", text: `Error fetching task list: ${pageData.message}` }] };
+            }
+            
+            const pageTasks = pageData.result || [];
+            allTasks = allTasks.concat(pageTasks);
+            
+            // Check if there are more pages
+            hasMorePages = currentPage < pageData.total_page;
+            currentPage++;
+            totalPages = pageData.total_page;
+            totalRecords = pageData.total_record;
+          }
+          
+          // Filter by employee name
+          allTasks = allTasks.filter((task: any) => 
+            task.employee_name && task.employee_name.toLowerCase().includes(employee_name.toLowerCase())
+          );
+        } else {
+          // Single page request (with pagination)
+          const data = await SHARED_UTILITIES.api.tasks.getList(params);
+          if (!data.success) {
+            return { content: [{ type: "text", text: `Error fetching task list: ${data.message}` }] };
+          }
+          allTasks = data.result || [];
+          totalPages = data.total_page;
+          totalRecords = data.total_record;
+          
+          // Filter by employee name if specified
+          if (employee_name) {
+            allTasks = allTasks.filter((task: any) => 
+              task.employee_name && task.employee_name.toLowerCase().includes(employee_name.toLowerCase())
+            );
+          }
+        }
+        
+        // Create a more readable format that highlights associates
+        const formattedTasks = allTasks.map((task: any) => {
+          const associatesInfo = task.associates && task.associates.length > 0 
+            ? task.associates.map((assoc: any) => 
+                `${assoc.linked_object_name} (${assoc.custom_number})`
+              ).join(', ')
+            : 'None';
+          
+          return {
+            task_id: task.task_id,
+            custom_number: task.custom_number,
+            title: task.title,
+            created_date: task.created_date,
+            due_date_show: task.due_date_show,
+            issue_type_value: task.issue_type_value,
+            priority_show: task.priority_show,
+            status_show: task.status_show,
+            employee_name: task.employee_name,
+            created_by_name: task.created_by_name,
+            progress: task.progress,
+            associates: associatesInfo,
+            associates_details: task.associates || []
+          };
+        });
+
+        const filterInfo = employee_name ? ` (Filtered by employee: ${employee_name})` : '';
+        const totalFilteredTasks = allTasks.length;
+        const paginationInfo = show_all ? '' : ` (Page ${page} of ${totalPages}, showing ${take} per page)`;
+        const totalInfo = show_all ? ` (Total: ${totalFilteredTasks} tasks)` : ` (Total available: ${totalRecords} tasks)`;
+        
+        let responseText = `Task List Results${filterInfo}${paginationInfo}${totalInfo}:\n\n${JSON.stringify(formattedTasks, null, 2)}`;
+        
+        // Add pagination guidance
+        if (!show_all && totalPages > 1) {
+          responseText += `\n\n📄 Pagination: Showing page ${page} of ${totalPages}. To see more tasks, ask for "next page" or "show more tasks". To see all tasks at once, ask for "show all tasks".`;
+        }
+        
+        responseText += `\n\n📋 Associates show linked objects (estimates, invoices, etc.) with their custom numbers. Full associate details are available in the associates_details field.`;
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: responseText
+            }
+          ]
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      }
+    }
+  );
+
+  // Get next page of task list
+  server.tool(
+    "getNextPageTasks",
+    "Get the next page of task list results. Use this when you want to see more tasks after viewing a paginated result.",
+    {
+      object_name: z.string().optional().describe("Object name for filtering"),
+      object_id: z.string().optional().describe("Object ID for filtering"),
+      filter: z.string().optional().describe("Filter criteria"),
+      employee_name: z.string().optional().describe("Employee name to filter tasks assigned to specific employee"),
+      current_page: z.number().describe("Current page number to get the next page from"),
+      take: z.number().optional().describe("Number of records to take per page (default: 20)"),
+      search: z.string().optional().describe("Search term to filter tasks")
+    },
+    async ({ object_name, object_id, filter, employee_name, current_page, take = 20, search }) => {
+      try {
+        const nextPage = current_page + 1;
+        const params: Record<string, any> = {
+          page: nextPage,
+          take
+        };
+
+        // Add optional parameters if provided
+        if (object_name) params.object_name = object_name;
+        if (object_id) params.object_id = object_id;
+        if (filter) params.filter = filter;
+        if (search) params.search = search;
+
+        const data = await SHARED_UTILITIES.api.tasks.getList(params);
+        if (!data.success) {
+          return { content: [{ type: "text", text: `Error fetching task list: ${data.message}` }] };
+        }
+
+        let tasks = data.result || [];
+        
+        // Filter by employee name if specified
+        if (employee_name) {
+          tasks = tasks.filter((task: any) => 
+            task.employee_name && task.employee_name.toLowerCase().includes(employee_name.toLowerCase())
+          );
+        }
+
+        // Create a more readable format that highlights associates
+        const formattedTasks = tasks.map((task: any) => {
+          const associatesInfo = task.associates && task.associates.length > 0 
+            ? task.associates.map((assoc: any) => 
+                `${assoc.linked_object_name} (${assoc.custom_number})`
+              ).join(', ')
+            : 'None';
+          
+          return {
+            task_id: task.task_id,
+            custom_number: task.custom_number,
+            title: task.title,
+            created_date: task.created_date,
+            due_date_show: task.due_date_show,
+            issue_type_value: task.issue_type_value,
+            priority_show: task.priority_show,
+            status_show: task.status_show,
+            employee_name: task.employee_name,
+            created_by_name: task.created_by_name,
+            progress: task.progress,
+            associates: associatesInfo,
+            associates_details: task.associates || []
+          };
+        });
+
+        const filterInfo = employee_name ? ` (Filtered by employee: ${employee_name})` : '';
+        const hasMorePages = nextPage < data.total_page;
+        
+        let responseText = `Task List Results${filterInfo} (Page ${nextPage} of ${data.total_page}, showing ${take} per page):\n\n${JSON.stringify(formattedTasks, null, 2)}`;
+        
+        if (hasMorePages) {
+          responseText += `\n\n📄 Pagination: Showing page ${nextPage} of ${data.total_page}. To see more tasks, ask for "next page" or "show more tasks".`;
+        } else {
+          responseText += `\n\n📄 Pagination: This is the last page (${data.total_page} of ${data.total_page}).`;
+        }
+        
+        responseText += `\n\n📋 Associates show linked objects (estimates, invoices, etc.) with their custom numbers. Full associate details are available in the associates_details field.`;
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: responseText
+            }
+          ]
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      }
+    }
+  );
+
+  // Get task details tool
+  server.tool(
+    "getTaskDetails",
+    "Get detailed information about a specific task using task ID. Returns comprehensive task information including description, assignee, due dates, status, and associated objects.",
+    {
+      task_id: z.number().describe("Task ID number to get details for"),
+      custom_number: z.string().optional().describe("Task custom number (alternative to task_id)")
+    },
+    async ({ task_id, custom_number }) => {
+      try {
+        const params: Record<string, any> = {};
+        
+        if (task_id) {
+          params.task_id = task_id;
+        } else if (custom_number) {
+          params.custom_number = custom_number;
+        } else {
+          return { content: [{ type: "text", text: "Error: Either task_id or custom_number is required." }] };
+        }
+
+        const data = task_id 
+          ? await SHARED_UTILITIES.api.tasks.getDetails(task_id)
+          : await SHARED_UTILITIES.api.tasks.getDetailsByCustomNumber(custom_number!);
+
+        if (!data.success) {
+          return { content: [{ type: "text", text: `Error fetching task details: ${data.message}` }] };
+        }
+
+        const task = data.result;
+        if (!task) {
+          return { content: [{ type: "text", text: "Task not found." }] };
+        }
+
+        // Format the task details in a readable way
+        const formattedTask = {
+          task_id: task.id,
+          custom_number: task.custom_number,
+          title: task.title,
+          description: task.description || "No description provided",
+          issue_type: task.issue_type_value,
+          priority: task.priority_show,
+          priority_color: task.priority_color,
+          status: task.status_show,
+          status_color: task.status_color,
+          label: task.label_value,
+          assignee: {
+            name: task.assign_to_name,
+            email: task.assign_to_email,
+            id: task.assign_to
+          },
+          dates: {
+            created: task.create_date,
+            due: task.due_date_show,
+            created_at: task.created_at,
+            updated_at: task.updated_at
+          },
+          created_by: task.created_by,
+          associates: task.associates && task.associates.length > 0 
+            ? task.associates.map((assoc: any) => ({
+                type: assoc.linked_object_name,
+                id: assoc.linked_object_id,
+                custom_number: assoc.custom_number,
+                url: assoc.url
+              }))
+            : [],
+          raw_data: task // Include full raw data for reference
+        };
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Task Details (${task.custom_number}):\n\n${JSON.stringify(formattedTask, null, 2)}\n\n📋 This includes all task information including assignee details, dates, status, priority, and associated objects (estimates, invoices, etc.).`
+            }
+          ]
+        };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error: ${error.message}` }] };
+      }
+    }
+  );
+
+
 }
 
 // Register analytics tools (for chart-ready business analysis)
 export function registerAnalyticsTools(server: McpServer) {
   server.tool(
     "analyzeBusinessData",
-    "Analyze business data and return chart-ready JSON for infographics. Supports queries like 'total sale for customer {customer name}'.",
+    "Analyze business data and return chart-ready JSON for infographics. Supports company-wide sales analytics and customer-specific analysis.",
     {
-      analysis_type: z.enum(["total_sale_for_customer"]).describe("Type of analysis to perform. Currently supports: total_sale_for_customer"),
-      customer_name: z.string().optional().describe("Customer name for customer-specific analysis"),
-      from_date: z.string().optional().describe("Start date filter (YYYY-MM-DD format)"),
-      to_date: z.string().optional().describe("End date filter (YYYY-MM-DD format)"),
+      analysis_type: z.enum(["total_sale_for_customer", "company_sales_analytics"]).describe("Type of analysis: total_sale_for_customer for specific customer, company_sales_analytics for company-wide analysis"),
+      customer_name: z.string().optional().describe("Customer name for customer-specific analysis (required for total_sale_for_customer)"),
+      from_date: z.string().optional().describe("Start date filter (YYYY-MM-DD format or natural language like 'this month', 'last quarter', 'Q1 2025')"),
+      to_date: z.string().optional().describe("End date filter (YYYY-MM-DD format or natural language like 'this month', 'last quarter', 'Q1 2025')"),
     },
     async ({ analysis_type, customer_name, from_date, to_date }) => {
       try {
+        // Parse natural language dates using shared utility functions
+        let parsedFromDate = from_date;
+        let parsedToDate = to_date;
+        
+        if (from_date) {
+          const parsed = SHARED_UTILITIES.date.parseNaturalLanguageDate(from_date);
+          if (parsed) {
+            parsedFromDate = parsed.start;
+          }
+        }
+        
+        if (to_date) {
+          const parsed = SHARED_UTILITIES.date.parseNaturalLanguageDate(to_date);
+          if (parsed) {
+            parsedToDate = parsed.end;
+          }
+        }
         if (analysis_type === "total_sale_for_customer") {
           if (!customer_name) {
             return {
@@ -1658,24 +2465,22 @@ export function registerAnalyticsTools(server: McpServer) {
             };
           }
 
-          // 1. Directly get all estimates for this customer_name as search term
-          const estimateSearch = await callIMPApi("/api/estimate/list", {
-            search: customer_name,
-            take: 1000,
-            ...(from_date && { from_date }),
-            ...(to_date && { to_date })
+          // 1. Use shared API utility to get estimates
+          const estimateSearch = await SHARED_UTILITIES.api.estimates.search(customer_name, {
+            from_date: parsedFromDate,
+            to_date: parsedToDate,
+            take: 1000
           });
           if (!estimateSearch.success) {
             return { content: [{ type: "text", text: `Error fetching estimates: ${estimateSearch.message}` }] };
           }
           const estimates = estimateSearch.result || [];
 
-          // 2. Directly get all invoices for this customer_name as search term
-          const invoiceSearch = await callIMPApi("/api/invoice_list", {
-            search: customer_name,
-            take: 1000,
-            ...(from_date && { from_date }),
-            ...(to_date && { to_date })
+          // 2. Use shared API utility to get invoices
+          const invoiceSearch = await SHARED_UTILITIES.api.invoices.search(customer_name, {
+            from_date: parsedFromDate,
+            to_date: parsedToDate,
+            take: 1000
           });
           if (!invoiceSearch.success) {
             return { content: [{ type: "text", text: `Error fetching invoices: ${invoiceSearch.message}` }] };
@@ -1739,45 +2544,510 @@ export function registerAnalyticsTools(server: McpServer) {
             if (!isNaN(val)) totalInvoiceAmount += val;
           }
 
-          // 6. Chart-ready JSON for open vs closed estimates (with colors)
-          const estimateChart = {
-            chartType: "pie",
-            title: `Estimates Status for ${customerDisplayName}`,
-            labels: ["Open", "Closed"],
-            datasets: [
-              {
-                label: "Estimates",
-                data: [openEstimates, closedEstimates],
-                backgroundColor: ["#36A2EB", "#4BC0C0"] // blue, teal
+          // 6. Generate summary
+          const summary = `Summary for ${customerDisplayName}:\n- Total Estimates: ${estimates.length}\n- Total Invoices: ${invoices.length}\n- Total Estimate Amount: $${totalEstimateAmount.toLocaleString()}\n- Total Invoice Amount: $${totalInvoiceAmount.toLocaleString()}\n- Open Estimates: ${openEstimates}\n- Closed Estimates: ${closedEstimates}\n- Open Invoices: ${openInvoices}\n- Paid Invoices: ${paidInvoices}\n- Conversion Rate: ${conversionRate.toFixed(2)}%`;
+
+          // 7. Return structured data for dynamic chart generation
+          const customerAnalyticsData = {
+            summary,
+            customer: {
+              name: customerDisplayName,
+              searchTerm: customer_name
+            },
+            metrics: {
+              estimates: {
+                total: estimates.length,
+                open: openEstimates,
+                closed: closedEstimates,
+                totalAmount: totalEstimateAmount,
+                statusBreakdown: estimateStatusCounts
+              },
+              invoices: {
+                total: invoices.length,
+                open: openInvoices,
+                paid: paidInvoices,
+                totalAmount: totalInvoiceAmount,
+                statusBreakdown: invoiceStatusCounts
+              },
+              conversion: {
+                rate: conversionRate,
+                closedEstimates,
+                totalEstimates: estimates.length
               }
-            ]
+            },
+            comparison: {
+              estimates: {
+                count: estimates.length,
+                amount: totalEstimateAmount
+              },
+              invoices: {
+                count: invoices.length,
+                amount: totalInvoiceAmount
+              }
+            },
+            dateRange: {
+              from: from_date,
+              to: to_date
+            },
+            rawData: {
+              estimates: estimates.length,
+              invoices: invoices.length,
+              totalEstimateAmount,
+              totalInvoiceAmount,
+              openEstimates,
+              closedEstimates,
+              openInvoices,
+              paidInvoices,
+              conversionRate
+            }
           };
 
-          // 7. Chart-ready JSON for open vs paid invoices (with colors)
-          const invoiceChart = {
-            chartType: "pie",
-            title: `Invoices Status for ${customerDisplayName}`,
-            labels: ["Open", "Paid"],
-            datasets: [
-              {
-                label: "Invoices",
-                data: [openInvoices, paidInvoices],
-                backgroundColor: ["#FF6384", "#36A2EB"] // red, blue
+          // Generate charts and infographics for customer analytics
+          const customerCharts = {
+            // Customer Sales Overview
+            salesOverview: {
+              type: "doughnut",
+              data: {
+                labels: ["Estimates", "Invoices"],
+                datasets: [{
+                  data: [customerAnalyticsData.metrics.estimates.totalAmount, customerAnalyticsData.metrics.invoices.totalAmount],
+                  backgroundColor: ["#FF6384", "#36A2EB"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: `Sales Overview - ${customerAnalyticsData.customer.name}`,
+                    font: { size: 16, weight: "bold" }
+                  },
+                  legend: {
+                    position: "bottom"
+                  }
+                }
+              }
+            },
+            
+            // Estimate Status Breakdown
+            estimateStatus: {
+              type: "pie",
+              data: {
+                labels: Object.keys(customerAnalyticsData.metrics.estimates.statusBreakdown),
+                datasets: [{
+                  data: Object.values(customerAnalyticsData.metrics.estimates.statusBreakdown),
+                  backgroundColor: ["#FF6384", "#36A2EB", "#FFCE56", "#4BC0C0", "#9966FF"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: "Estimate Status Breakdown",
+                    font: { size: 14, weight: "bold" }
+                  }
+                }
+              }
+            },
+            
+            // Invoice Status Breakdown
+            invoiceStatus: {
+              type: "pie",
+              data: {
+                labels: Object.keys(customerAnalyticsData.metrics.invoices.statusBreakdown),
+                datasets: [{
+                  data: Object.values(customerAnalyticsData.metrics.invoices.statusBreakdown),
+                  backgroundColor: ["#FF6384", "#36A2EB", "#FFCE56", "#4BC0C0"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: "Invoice Status Breakdown",
+                    font: { size: 14, weight: "bold" }
+                  }
+                }
+              }
+            },
+            
+            // Conversion Rate Gauge
+            conversionGauge: {
+              type: "doughnut",
+              data: {
+                labels: ["Converted", "Not Converted"],
+                datasets: [{
+                  data: [customerAnalyticsData.metrics.conversion.closedEstimates, customerAnalyticsData.metrics.conversion.totalEstimates - customerAnalyticsData.metrics.conversion.closedEstimates],
+                  backgroundColor: ["#4BC0C0", "#FF6384"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: `Conversion Rate: ${customerAnalyticsData.metrics.conversion.rate.toFixed(1)}%`,
+                    font: { size: 14, weight: "bold" }
+                  }
+                }
+              }
+            }
+          };
+
+          return {
+            content: [
+              { 
+                type: "text", 
+                text: JSON.stringify({
+                  summary: customerAnalyticsData.summary,
+                  charts: customerCharts,
+                  rawData: customerAnalyticsData
+                }, null, 2) 
               }
             ]
           };
-         
-          // 9. Human summary string
-          // const summaryString = await generateSummaryWithClaude({ estimateChart, invoiceChart }); // Removed Anthropic call
-          // 10. Only return chart JSON, no summary, no [DISPLAY_VERBATIM]
-          const chartJson = {
-            estimateChart,
-            invoiceChart,
-            summary: `Summary for ${customerDisplayName}:\n- Total Estimates: ${estimates.length}\n- Total Invoices: ${invoices.length}\n- Total Estimate Amount: $${totalEstimateAmount.toLocaleString()}\n- Total Invoice Amount: $${totalInvoiceAmount.toLocaleString()}\n- Open Estimates: ${openEstimates}\n- Closed Estimates: ${closedEstimates}\n- Open Invoices: ${openInvoices}\n- Paid Invoices: ${paidInvoices}\n- Conversion Rate: ${conversionRate.toFixed(2)}%`
+        } else if (analysis_type === "company_sales_analytics") {
+          // Company-wide sales analytics for any date range
+          
+          // 1. Use shared API utility to get all estimates for the date range
+          const estimateSearch = await SHARED_UTILITIES.api.estimates.getList({
+            from_date: parsedFromDate,
+            to_date: parsedToDate,
+            take: 1000
+          });
+          if (!estimateSearch.success) {
+            return { content: [{ type: "text", text: `Error fetching estimates: ${estimateSearch.message}` }] };
+          }
+          const estimates = estimateSearch.result || [];
+
+          // 2. Use shared API utility to get all invoices for the date range
+          const invoiceSearch = await SHARED_UTILITIES.api.invoices.getList({
+            from_date: parsedFromDate,
+            to_date: parsedToDate,
+            take: 1000
+          });
+          if (!invoiceSearch.success) {
+            return { content: [{ type: "text", text: `Error fetching invoices: ${invoiceSearch.message}` }] };
+          }
+          const invoices = invoiceSearch.result || [];
+
+          // If no data found, show a clear message
+          if (estimates.length === 0 && invoices.length === 0) {
+            const dateRange = parsedFromDate && parsedToDate ? ` from ${parsedFromDate} to ${parsedToDate}` : parsedFromDate ? ` from ${parsedFromDate}` : parsedToDate ? ` until ${parsedToDate}` : '';
+            const originalDateRange = from_date && to_date ? ` (original: ${from_date} to ${to_date})` : from_date ? ` (original: ${from_date})` : to_date ? ` (original: ${to_date})` : '';
+            return {
+              content: [
+                { type: "text", text: `No sales data (estimates or invoices) found${dateRange}${originalDateRange}. Try a different date range or check if there's data for the specified period.` }
+              ]
+            };
+          }
+
+          // 3. Aggregate statuses for estimates and invoices
+          const estimateStatusCounts: Record<string, number> = {};
+          let openEstimates = 0, closedEstimates = 0;
+          for (const est of estimates) {
+            const status = (est.status_name || '').toLowerCase();
+            estimateStatusCounts[status] = (estimateStatusCounts[status] || 0) + 1;
+            if (status.includes('open') || status.includes('pending') || status.includes('draft')) openEstimates++;
+            else if (status.includes('closed') || status.includes('accepted') || status.includes('won') || status.includes('converted')) closedEstimates++;
+          }
+
+          const invoiceStatusCounts: Record<string, number> = {};
+          let openInvoices = 0, paidInvoices = 0;
+          for (const inv of invoices) {
+            const status = (inv.status_name || '').toLowerCase();
+            invoiceStatusCounts[status] = (invoiceStatusCounts[status] || 0) + 1;
+            if (status.includes('open') || status.includes('unpaid') || status.includes('pending')) openInvoices++;
+            else if (status.includes('paid') || status.includes('closed') || status.includes('complete')) paidInvoices++;
+          }
+
+          // 4. Calculate totals
+          let totalEstimateAmount = 0;
+          let totalInvoiceAmount = 0;
+          for (const est of estimates) {
+            let val = 0;
+            if (est.totals && est.totals.grand_total) val = parseFloat(est.totals.grand_total);
+            else if (est.grand_total) val = parseFloat(est.grand_total);
+            else if (est.quotation_total) val = parseFloat(est.quotation_total);
+            if (!isNaN(val)) totalEstimateAmount += val;
+          }
+          for (const inv of invoices) {
+            let val = 0;
+            if (inv.totals && inv.totals.grand_total) val = parseFloat(inv.totals.grand_total);
+            else if (inv.grand_total) val = parseFloat(inv.grand_total);
+            if (!isNaN(val)) totalInvoiceAmount += val;
+          }
+
+          // 5. Calculate conversion rate
+          let conversionRate = estimates.length > 0 ? (closedEstimates / estimates.length) * 100 : 0;
+
+          // 6. Monthly trend analysis (if date range spans multiple months)
+          const monthlyData: Record<string, { estimates: number; invoices: number; estimateAmount: number; invoiceAmount: number }> = {};
+          
+          estimates.forEach((est: any) => {
+            const date = new Date(est.created_at || est.created_date);
+            const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+            if (!monthlyData[monthKey]) {
+              monthlyData[monthKey] = { estimates: 0, invoices: 0, estimateAmount: 0, invoiceAmount: 0 };
+            }
+            monthlyData[monthKey].estimates++;
+            let val = 0;
+            if (est.totals && est.totals.grand_total) val = parseFloat(est.totals.grand_total);
+            else if (est.grand_total) val = parseFloat(est.grand_total);
+            else if (est.quotation_total) val = parseFloat(est.quotation_total);
+            if (!isNaN(val)) monthlyData[monthKey].estimateAmount += val;
+          });
+
+          invoices.forEach((inv: any) => {
+            const date = new Date(inv.created_at || inv.created_date);
+            const monthKey = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+            if (!monthlyData[monthKey]) {
+              monthlyData[monthKey] = { estimates: 0, invoices: 0, estimateAmount: 0, invoiceAmount: 0 };
+            }
+            monthlyData[monthKey].invoices++;
+            let val = 0;
+            if (inv.totals && inv.totals.grand_total) val = parseFloat(inv.totals.grand_total);
+            else if (inv.grand_total) val = parseFloat(inv.grand_total);
+            if (!isNaN(val)) monthlyData[monthKey].invoiceAmount += val;
+          });
+
+          // 7. Generate summary
+          const dateRange = parsedFromDate && parsedToDate ? ` from ${parsedFromDate} to ${parsedToDate}` : parsedFromDate ? ` from ${parsedFromDate}` : parsedToDate ? ` until ${parsedToDate}` : '';
+          const originalDateRange = from_date && to_date ? ` (original: ${from_date} to ${to_date})` : from_date ? ` (original: ${from_date})` : to_date ? ` (original: ${to_date})` : '';
+          const summary = `Company Sales Analytics${dateRange}${originalDateRange}:\n- Total Estimates: ${estimates.length}\n- Total Invoices: ${invoices.length}\n- Total Estimate Amount: $${totalEstimateAmount.toLocaleString()}\n- Total Invoice Amount: $${totalInvoiceAmount.toLocaleString()}\n- Open Estimates: ${openEstimates}\n- Closed Estimates: ${closedEstimates}\n- Open Invoices: ${openInvoices}\n- Paid Invoices: ${paidInvoices}\n- Conversion Rate: ${conversionRate.toFixed(2)}%`;
+
+          // 8. Return structured data for dynamic chart generation
+          const analyticsData = {
+            summary,
+            metrics: {
+              estimates: {
+                total: estimates.length,
+                open: openEstimates,
+                closed: closedEstimates,
+                totalAmount: totalEstimateAmount,
+                statusBreakdown: estimateStatusCounts
+              },
+              invoices: {
+                total: invoices.length,
+                open: openInvoices,
+                paid: paidInvoices,
+                totalAmount: totalInvoiceAmount,
+                statusBreakdown: invoiceStatusCounts
+              },
+              conversion: {
+                rate: conversionRate,
+                closedEstimates,
+                totalEstimates: estimates.length
+              }
+            },
+            comparison: {
+              estimates: {
+                count: estimates.length,
+                amount: totalEstimateAmount
+              },
+              invoices: {
+                count: invoices.length,
+                amount: totalInvoiceAmount
+              }
+            },
+            trends: {
+              monthlyData,
+              hasMultipleMonths: Object.keys(monthlyData).length > 1,
+              monthLabels: Object.keys(monthlyData).sort(),
+              estimateTrends: Object.keys(monthlyData).sort().map(month => ({
+                month,
+                count: monthlyData[month].estimates,
+                amount: monthlyData[month].estimateAmount
+              })),
+              invoiceTrends: Object.keys(monthlyData).sort().map(month => ({
+                month,
+                count: monthlyData[month].invoices,
+                amount: monthlyData[month].invoiceAmount
+              }))
+            },
+            dateRange: {
+              from: parsedFromDate,
+              to: parsedToDate,
+              original: {
+                from: from_date,
+                to: to_date
+              },
+              display: dateRange
+            },
+            rawData: {
+              estimates: estimates.length,
+              invoices: invoices.length,
+              totalEstimateAmount,
+              totalInvoiceAmount,
+              openEstimates,
+              closedEstimates,
+              openInvoices,
+              paidInvoices,
+              conversionRate,
+              monthlyData
+            }
           };
+
+          // Generate charts and infographics from the analytics data
+          const charts = {
+            // Sales Overview Chart
+            salesOverview: {
+              type: "doughnut",
+              data: {
+                labels: ["Estimates", "Invoices"],
+                datasets: [{
+                  data: [analyticsData.metrics.estimates.totalAmount, analyticsData.metrics.invoices.totalAmount],
+                  backgroundColor: ["#FF6384", "#36A2EB"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: "Sales Overview - This Month",
+                    font: { size: 16, weight: "bold" }
+                  },
+                  legend: {
+                    position: "bottom"
+                  }
+                }
+              }
+            },
+            
+            // Status Breakdown Charts
+            estimateStatus: {
+              type: "pie",
+              data: {
+                labels: Object.keys(analyticsData.metrics.estimates.statusBreakdown),
+                datasets: [{
+                  data: Object.values(analyticsData.metrics.estimates.statusBreakdown),
+                  backgroundColor: ["#FF6384", "#36A2EB", "#FFCE56", "#4BC0C0", "#9966FF"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: "Estimate Status Breakdown",
+                    font: { size: 14, weight: "bold" }
+                  }
+                }
+              }
+            },
+            
+            invoiceStatus: {
+              type: "pie",
+              data: {
+                labels: Object.keys(analyticsData.metrics.invoices.statusBreakdown),
+                datasets: [{
+                  data: Object.values(analyticsData.metrics.invoices.statusBreakdown),
+                  backgroundColor: ["#FF6384", "#36A2EB", "#FFCE56", "#4BC0C0"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: "Invoice Status Breakdown",
+                    font: { size: 14, weight: "bold" }
+                  }
+                }
+              }
+            },
+            
+            // Monthly Trends Chart
+            monthlyTrends: analyticsData.trends.hasMultipleMonths ? {
+              type: "line",
+              data: {
+                labels: analyticsData.trends.monthLabels,
+                datasets: [
+                  {
+                    label: "Estimate Amount",
+                    data: analyticsData.trends.estimateTrends.map(t => t.amount),
+                    borderColor: "#FF6384",
+                    backgroundColor: "rgba(255, 99, 132, 0.1)",
+                    tension: 0.4
+                  },
+                  {
+                    label: "Invoice Amount",
+                    data: analyticsData.trends.invoiceTrends.map(t => t.amount),
+                    borderColor: "#36A2EB",
+                    backgroundColor: "rgba(54, 162, 235, 0.1)",
+                    tension: 0.4
+                  }
+                ]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: "Monthly Sales Trends",
+                    font: { size: 16, weight: "bold" }
+                  },
+                  legend: {
+                    position: "bottom"
+                  }
+                },
+                scales: {
+                  y: {
+                    beginAtZero: true,
+                    ticks: {
+                      callback: function(value: any) {
+                        return "$" + value.toLocaleString();
+                      }
+                    }
+                  }
+                }
+              }
+            } : null,
+            
+            // Conversion Rate Gauge
+            conversionGauge: {
+              type: "doughnut",
+              data: {
+                labels: ["Converted", "Not Converted"],
+                datasets: [{
+                  data: [analyticsData.metrics.conversion.closedEstimates, analyticsData.metrics.conversion.totalEstimates - analyticsData.metrics.conversion.closedEstimates],
+                  backgroundColor: ["#4BC0C0", "#FF6384"],
+                  borderWidth: 2
+                }]
+              },
+              options: {
+                responsive: true,
+                plugins: {
+                  title: {
+                    display: true,
+                    text: `Conversion Rate: ${analyticsData.metrics.conversion.rate.toFixed(1)}%`,
+                    font: { size: 14, weight: "bold" }
+                  }
+                }
+              }
+            }
+          };
+
           return {
             content: [
-              { type: "text", text: JSON.stringify(chartJson, null, 2) }
+              { 
+                type: "text", 
+                text: JSON.stringify({
+                  summary: analyticsData.summary,
+                  charts: charts,
+                  rawData: analyticsData
+                }, null, 2) 
+              }
             ]
           };
         }
