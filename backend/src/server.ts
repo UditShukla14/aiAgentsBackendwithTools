@@ -15,7 +15,7 @@ import { SYSTEM_PROMPT } from './resources/prompts.js';
 import { allowedOrigins } from './resources/staticData.js';
 import { filterInternalIds, classifyQuery, getSystemPrompt, getMaxTokens } from "./server-util.js";
 import { pathToFileURL } from 'url';
-import { saveConversation, getConversations, deleteConversation, updateConversationTitle, generateTitleFromMessages } from './conversation-db.js';
+import { saveConversation, getConversations, getConversation, deleteConversation, updateConversationTitle } from './conversation-db.js';
 
 dotenv.config();
 
@@ -1399,6 +1399,26 @@ app.get('/api/conversations', async (req, res) => {
   }
 });
 
+
+
+// Get a single conversation
+app.get('/api/conversations/:sessionId', async (req, res) => {
+  try {
+    const userId = req.query.userId as string;
+    const sessionId = req.params.sessionId;
+    if (!userId || !sessionId) {
+      return res.status(400).json({ error: 'Missing userId or sessionId' });
+    }
+    const conversation = await getConversation(userId, sessionId);
+    if (!conversation) {
+      return res.status(404).json({ error: 'Conversation not found' });
+    }
+    res.json({ conversation });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch conversation' });
+  }
+});
+
 app.post('/api/conversations', async (req, res) => {
   try {
     const { userId, sessionId, messages, title } = req.body;
@@ -1411,6 +1431,8 @@ app.post('/api/conversations', async (req, res) => {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save conversation' });
   }
 });
+
+
 
 app.delete('/api/conversations', async (req, res) => {
   try {
@@ -1438,6 +1460,8 @@ app.put('/api/conversations/title', async (req, res) => {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update conversation title' });
   }
 });
+
+
 
 // Keep manual connect endpoint for fallback/reconnection
 app.post('/api/connect', async (req, res) => {

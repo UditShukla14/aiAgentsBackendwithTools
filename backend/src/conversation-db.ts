@@ -74,6 +74,8 @@ export async function getConversations(userId: string) {
   return ConversationModel.find({ userId }).sort({ createdAt: -1 }).lean();
 }
 
+
+
 export async function getConversation(userId: string, sessionId: string) {
   await connectToMongo();
   return ConversationModel.findOne({ userId, sessionId }).lean();
