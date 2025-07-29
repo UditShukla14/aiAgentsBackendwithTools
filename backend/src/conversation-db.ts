@@ -16,6 +16,7 @@ const MessageSchema = new Schema({
 const ConversationSchema = new Schema({
   userId: { type: String, required: true, index: true },
   sessionId: { type: String, required: true, index: true },
+  title: { type: String, default: '' }, // Add title field
   messages: { type: [MessageSchema], default: [] },
   createdAt: { type: Date, default: Date.now },
 }, { collection: 'conversations' });
@@ -32,6 +33,7 @@ export interface IMessage {
 export interface IConversation extends Document {
   userId: string;
   sessionId: string;
+  title: string; // Add title to interface
   messages: IMessage[];
   createdAt: Date;
 }
@@ -49,11 +51,20 @@ export async function connectToMongo() {
   }
 }
 
-export async function saveConversation(userId: string, sessionId: string, messages: IMessage[]) {
+export async function saveConversation(userId: string, sessionId: string, messages: IMessage[], title?: string) {
   await connectToMongo();
+  
+  // If no title provided, generate one from messages
+  let finalTitle = title;
+  if (!finalTitle) {
+    finalTitle = generateTitleFromMessages(messages);
+  }
+  
+  const updateData: any = { messages, createdAt: new Date(), title: finalTitle };
+  
   await ConversationModel.findOneAndUpdate(
     { userId, sessionId },
-    { $set: { messages, createdAt: new Date() } },
+    { $set: updateData },
     { upsert: true, new: true }
   );
 }
@@ -71,4 +82,44 @@ export async function getConversation(userId: string, sessionId: string) {
 export async function deleteConversation(userId: string, sessionId: string) {
   await connectToMongo();
   await ConversationModel.deleteOne({ userId, sessionId });
+}
+
+export async function updateConversationTitle(userId: string, sessionId: string, title: string) {
+  await connectToMongo();
+  await ConversationModel.findOneAndUpdate(
+    { userId, sessionId },
+    { $set: { title } },
+    { new: true }
+  );
+}
+
+// Utility function to generate title from first user message
+export function generateTitleFromMessages(messages: IMessage[]): string {
+  if (!messages || messages.length === 0) {
+    return 'New Conversation';
+  }
+  
+  // Find the first user message
+  const firstUserMessage = messages.find(msg => msg.role === 'user');
+  if (!firstUserMessage) {
+    return 'New Conversation';
+  }
+  
+  // Extract title from first user message
+  let title = firstUserMessage.content.trim();
+  
+  // Limit title length
+  if (title.length > 50) {
+    title = title.substring(0, 47) + '...';
+  }
+  
+  // Remove common prefixes that don't make good titles
+  title = title.replace(/^(hi|hello|hey|can you|please|help me|i need|i want|show me|find|search for|get|tell me|what is|how do|when|where|who)\s+/i, '');
+  
+  // Capitalize first letter
+  if (title.length > 0) {
+    title = title.charAt(0).toUpperCase() + title.slice(1);
+  }
+  
+  return title || 'New Conversation';
 } 

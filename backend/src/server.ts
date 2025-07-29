@@ -15,7 +15,7 @@ import { SYSTEM_PROMPT } from './resources/prompts.js';
 import { allowedOrigins } from './resources/staticData.js';
 import { filterInternalIds, classifyQuery, getSystemPrompt, getMaxTokens } from "./server-util.js";
 import { pathToFileURL } from 'url';
-import { saveConversation, getConversations, deleteConversation } from './conversation-db.js';
+import { saveConversation, getConversations, deleteConversation, updateConversationTitle, generateTitleFromMessages } from './conversation-db.js';
 
 dotenv.config();
 
@@ -63,7 +63,7 @@ const io = new SocketIOServer(httpServer, {
 
 app.use(cors({
   origin: allowedOrigins,
-  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,
   allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"],
   exposedHeaders: ["Content-Length", "Content-Range"]
@@ -1401,11 +1401,11 @@ app.get('/api/conversations', async (req, res) => {
 
 app.post('/api/conversations', async (req, res) => {
   try {
-    const { userId, sessionId, messages } = req.body;
+    const { userId, sessionId, messages, title } = req.body;
     if (!userId || !sessionId || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'Missing userId, sessionId, or messages' });
     }
-    await saveConversation(userId, sessionId, messages);
+    await saveConversation(userId, sessionId, messages, title);
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save conversation' });
@@ -1422,6 +1422,20 @@ app.delete('/api/conversations', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete conversation' });
+  }
+});
+
+// NEW: Update conversation title endpoint
+app.put('/api/conversations/title', async (req, res) => {
+  try {
+    const { userId, sessionId, title } = req.body;
+    if (!userId || !sessionId || !title) {
+      return res.status(400).json({ error: 'Missing userId, sessionId, or title' });
+    }
+    await updateConversationTitle(userId, sessionId, title);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update conversation title' });
   }
 });
 
