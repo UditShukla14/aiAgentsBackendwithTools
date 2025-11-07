@@ -37,11 +37,14 @@ if (!anthropicApiKey) {
 }
 const anthropic = new Anthropic({ apiKey: anthropicApiKey });
 
+// Model name configuration - default to standard Claude 3.5 Sonnet
+const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-haiku-20240307";
+
 async function generateSummaryWithClaude(chartJson: any) {
   const prompt = `
 You are an expert business analyst. Given the following sales analytics data as JSON, write a concise, insightful summary for a business user. Highlight key metrics, trends, and any notable insights.\n\nData:\n${JSON.stringify(chartJson, null, 2)}\n\nSummary:`;
   const response = await anthropic.messages.create({
-    model: "claude-3-5-sonnet-20241022",
+    model: ANTHROPIC_MODEL,
     max_tokens: 256,
     messages: [{ role: "user", content: prompt }]
   });
@@ -352,7 +355,7 @@ Current conversation context:
       const response = await globalRateLimiter.execute(() =>
         RetryManager.retryWithExponentialBackoff(() =>
           this.anthropic.messages.create({
-            model: "claude-3-5-sonnet-20241022",
+            model: ANTHROPIC_MODEL,
             max_tokens: maxTokens,
             system: contextualSystemPrompt,
             messages,
@@ -745,7 +748,7 @@ private async continueStreamingConversation(
       const response = await globalRateLimiter.execute(() =>
         RetryManager.retryWithExponentialBackoff(() =>
           this.anthropic.messages.create({
-            model: "claude-3-5-sonnet-20241022",
+            model: ANTHROPIC_MODEL,
             max_tokens: maxTokens,
             system: systemPrompt,
             messages: currentMessages,
