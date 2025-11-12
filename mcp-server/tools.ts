@@ -504,7 +504,7 @@ export const SHARED_UTILITIES = {
 
 // Static data for MCP server tools
 
-export const BASE_URL = "https://invoicemakerpro.com";
+export const BASE_URL = "https://app.invoicemakerpro.com";
 export const HARDCODED_TOKEN = "SERVICESEERS_EAAAEAcaEROsO6yeAPYugIlrKsouynS5f0iDnXQ";
 export const HARDCODED_ROLE = "company";
 
@@ -1018,13 +1018,27 @@ export function registerBusinessTools(server: McpServer) {
         if (!data.success) {
           return { content: [{ type: "text", text: `Error fetching products: ${data.message}` }] };
         }
-  
+
+        const products = data.result || [];
+        
+        // Format products as clean array for TABLE rendering in UI
+        const productArray = products.map((product: any) => ({
+          "Product Name": product.product_name || product.name,
+          "SKU": product.sku || product.product_sku || '-',
+          "Category": product.category || product.product_category || '-',
+          "Price": product.selling_price ? `$${parseFloat(product.selling_price).toFixed(2)}` : '-',
+          "Status": product.status || product.product_status || 'Active'
+        }));
+
+        // Return combined message: table + summary
+        const summary = `Found ${products.length} product${products.length !== 1 ? 's' : ''} matching "${search}".`;
+        
         return {
           content: [
             {
               type: "text",
-              text: `Found ${data.result?.length || 0} products matching "${search}":\n\n${JSON.stringify(data.result || [], null, 2)}\n\n💡 Tip: To get detailed information about any of these products, you can ask "get details for [product name]" or use the exact product ID.`,
-            },
+              text: `<table>${JSON.stringify(productArray)}</table>\n\n${summary}`
+            }
           ],
         };
       } catch (error: any) {
@@ -1070,15 +1084,16 @@ export function registerBusinessTools(server: McpServer) {
   // Search Estimate List Tool
   server.tool(
     "searchEstimateList",
-    "Get list of estimates with optional filtering by date range and search term",
+    "Get list of estimates with optional filtering by date range, search term, and status",
     {
       from_date: z.string().optional().describe("Start date filter (YYYY-MM-DD format)"),
       to_date: z.string().optional().describe("End date filter (YYYY-MM-DD format)"),
       search: z.string().optional().describe("Search term for estimate number, customer name, etc."),
+      status: z.string().optional().describe("Filter by status: 'open', 'closed', 'accepted', 'rejected', 'draft', 'sent', etc."),
       take: z.number().default(25).describe("Number of estimates to return (default: 25)"),
       skip: z.number().optional().describe("Number of estimates to skip for pagination"),
     },
-    async ({ from_date, to_date, search, take = 25, skip }) => {
+    async ({ from_date, to_date, search, status, take = 25, skip }) => {
       try {
         // Enhanced date cleaning and validation
         const cleanDate = (date: string | undefined): string | undefined => {
@@ -1144,6 +1159,7 @@ export function registerBusinessTools(server: McpServer) {
           from_date: cleanFromDate,
           to_date: cleanToDate,
           search,
+          status,
           take,
           skip
         });
@@ -1151,12 +1167,28 @@ export function registerBusinessTools(server: McpServer) {
         if (!data.success) {
           return { content: [{ type: "text", text: `Error fetching estimates: ${data.message}` }] };
         }
-  
+
+        const estimates = data.result || [];
+        
+        // Format estimates as clean array for TABLE rendering in UI
+        const estimateArray = estimates.map((estimate: any) => ({
+          "Estimate #": estimate.custom_quotation_number,
+          "Customer": estimate.customer_name,
+          "Date": estimate.create_date,
+          "Amount": `$${parseFloat(estimate.quotation_total || 0).toFixed(2)}`,
+          "Status": estimate.status_name,
+          "Job": estimate.job_name,
+          "Location": estimate.job_location
+        }));
+
+        // Return combined message: table + summary
+        const summary = `Found ${estimates.length} estimates${cleanFromDate && cleanToDate ? ` from ${cleanFromDate} to ${cleanToDate}` : ''}.`;
+        
         return {
           content: [
             {
               type: "text",
-              text: `Found ${data.result?.length || 0} estimates:\n\n${JSON.stringify(data.result || [], null, 2)}\n\n📋 Use filters like from_date, to_date, or search to narrow down results.`,
+              text: `<table>${JSON.stringify(estimateArray)}</table>\n\n${summary}`,
             },
           ],
         };
@@ -1171,16 +1203,17 @@ export function registerBusinessTools(server: McpServer) {
   // Search Invoice List Tool
   server.tool(
     "searchInvoiceList",
-    "Get list of invoices with optional filtering by date range and search term. When user asks for 'all invoices', 'complete list', 'full data', or similar requests, set get_all to true to fetch all records in a single request.",
+    "Get list of invoices with optional filtering by date range, search term, and status. When user asks for 'all invoices', 'complete list', 'full data', or similar requests, set get_all to true to fetch all records in a single request.",
     {
       from_date: z.string().optional().describe("Start date filter (YYYY-MM-DD format)"),
       to_date: z.string().optional().describe("End date filter (YYYY-MM-DD format)"),
       search: z.string().optional().describe("Search term for invoice number, customer name, etc."),
+      status: z.string().optional().describe("Filter by status: 'open', 'paid', 'overdue', 'cancelled', etc."),
       take: z.number().default(25).describe("Number of invoices to return (default: 25)"),
       skip: z.number().optional().describe("Number of invoices to skip for pagination"),
       get_all: z.boolean().default(false).describe("Set to true when user requests all data, complete list, or full records. This will fetch all records in a single request."),
     },
-    async ({ from_date, to_date, search, take = 25, skip, get_all = false }) => {
+    async ({ from_date, to_date, search, status, take = 25, skip, get_all = false }) => {
       try {
         // Enhanced date cleaning and validation
         const cleanDate = (date: string | undefined): string | undefined => {
@@ -1267,10 +1300,11 @@ export function registerBusinessTools(server: McpServer) {
           ...(cleanFromDate && { from_date: cleanFromDate }),
           ...(cleanToDate && { to_date: cleanToDate }),
           ...(search && { search }),
+          ...(status && { status }),
           take: get_all ? totalRecords : take,
           ...(skip && { skip })
         };
-  
+
         const data = await SHARED_UTILITIES.api.invoices.getList(params);
   
         if (!data.success) {
@@ -1279,68 +1313,28 @@ export function registerBusinessTools(server: McpServer) {
   
         const invoices = data.result || [];
         
-        const formattedResponse = {
-          total_invoices: data.total_record || 0,
-          total_pages: data.total_page || 1,
-          current_page: data.page || 1,
-          invoices_per_page: get_all ? totalRecords : take,
-          date_range: {
-            from: cleanFromDate,
-            to: cleanToDate
-          },
-          search_params: {
-            search_term: search,
-            take: get_all ? totalRecords : take,
-            skip,
-            get_all
-          },
-          pagination: {
-            current_page: data.page || 1,
-            total_pages: data.total_page || 1,
-            has_next: data.links?.some((link: any) => link.label === "Next &raquo;"),
-            has_previous: data.links?.some((link: any) => link.label === "&laquo; Previous"),
-            page_links: data.links?.map((link: any) => ({
-              label: link.label,
-              url: link.url,
-              is_active: link.active
-            }))
-          },
-          invoices: invoices.map((invoice: any) => ({
-            id: invoice.invoice_id,
-            custom_number: invoice.custom_invoice_number,
-            invoice_date: invoice.invoice_date,
-            customer: {
-              id: invoice.customer_id,
-              name: invoice.customer_name,
-              email: invoice.customer_email,
-              phone: invoice.customer_phone
-            },
-            status: {
-              id: invoice.status_id,
-              name: invoice.status_name,
-              color: invoice.status_color
-            },
-            totals: {
-              subtotal: invoice.sub_total,
-              discount: invoice.discount,
-              tax: invoice.tax,
-              grand_total: invoice.grand_total
-            },
-            po_number: invoice.ext_po_number,
-            quotation_id: invoice.quotation_id,
-            preview_url: invoice.preview,
-            payment_preview_url: invoice.payment_preview
-          }))
-        };
-  
+        // Format invoices as clean array for TABLE rendering in UI
+        // This array will be rendered as an interactive table by the frontend
+        const invoiceArray = invoices.map((invoice: any) => ({
+          "Invoice #": invoice.custom_invoice_number,
+          "Customer": invoice.customer_name,
+          "Date": invoice.invoice_date,
+          "Amount": `$${parseFloat(invoice.grand_total || 0).toFixed(2)}`,
+          "Status": invoice.status_name,
+          "Email": invoice.customer_email,
+          "Phone": invoice.customer_phone
+        }));
+
+        // Return combined message: table + summary
+        const summary = `Found ${invoices.length} invoices${cleanFromDate && cleanToDate ? ` from ${cleanFromDate} to ${cleanToDate}` : ''}.`;
+        
         return {
-          content: [{
-            type: "text",
-            text: JSON.stringify({
-              formatted: formattedResponse,
-              raw: data
-            }, null, 2)
-          }]
+          content: [
+            {
+              type: "text",
+              text: `<table>${JSON.stringify(invoiceArray)}</table>\n\n${summary}`
+            }
+          ]
         };
   
       } catch (error: any) {
@@ -1431,12 +1425,24 @@ export function registerBusinessTools(server: McpServer) {
           }
         }
   
+        // Format customers as clean array for TABLE rendering in UI
+        const customerArray = normalizedCustomers.map((customer: any) => ({
+          "Name": customer.customer_name || customer.name,
+          "Email": customer.email || customer.customer_email,
+          "Phone": customer.phone || customer.customer_phone,
+          "Company": customer.company_name || customer.business_name || '-',
+          "Status": customer.customer_status || customer.status || 'Active'
+        }));
+
+        // Return combined message: table + summary
+        const summary = `Found ${normalizedCustomers.length} customer${normalizedCustomers.length !== 1 ? 's' : ''}.`;
+        
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ result: normalizedCustomers })
-            },
+              text: `<table>${JSON.stringify(customerArray)}</table>\n\n${summary}`
+            }
           ],
         };
       } catch (error: any) {

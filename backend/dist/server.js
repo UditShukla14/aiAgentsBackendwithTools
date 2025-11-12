@@ -15,6 +15,7 @@ import { SYSTEM_PROMPT } from './resources/prompts.js';
 import { allowedOrigins } from './resources/staticData.js';
 import { filterInternalIds, classifyQuery, getSystemPrompt, getMaxTokens } from "./server-util.js";
 import { pathToFileURL } from 'url';
+import { saveConversation, getConversations, getConversation, deleteConversation, updateConversationTitle } from './conversation-db.js';
 dotenv.config();
 // Add MCP server path configuration
 // Resolve __dirname in ES module context
@@ -29,11 +30,13 @@ if (!anthropicApiKey) {
     throw new Error("ANTHROPIC_API_KEY is not set in the environment");
 }
 const anthropic = new Anthropic({ apiKey: anthropicApiKey });
+// Model name configuration - default to standard Claude 3.5 Sonnet
+const ANTHROPIC_MODEL = "claude-3-haiku-20240307";
 async function generateSummaryWithClaude(chartJson) {
     const prompt = `
 You are an expert business analyst. Given the following sales analytics data as JSON, write a concise, insightful summary for a business user. Highlight key metrics, trends, and any notable insights.\n\nData:\n${JSON.stringify(chartJson, null, 2)}\n\nSummary:`;
     const response = await anthropic.messages.create({
-        model: "claude-3-5-sonnet-20241022",
+        model: ANTHROPIC_MODEL,
         max_tokens: 256,
         messages: [{ role: "user", content: prompt }]
     });
@@ -45,14 +48,40 @@ const io = new SocketIOServer(httpServer, {
     path: "/socket.io",
     cors: {
         origin: allowedOrigins,
-        methods: ["GET", "POST"],
-        credentials: true
+        methods: ["GET", "POST", "OPTIONS"],
+        credentials: true,
+        allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"]
     }
 });
 app.use(cors({
-    origin: allowedOrigins,
-    methods: ["GET", "POST"],
-    credentials: true
+    origin: function (origin, callback) {
+        // Allow requests with no origin (like mobile apps, Postman, curl)
+        if (!origin) {
+            return callback(null, true);
+        }
+        // Check if origin is in allowed list
+        if (allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+        // Allow Expo origins (exp://, expo://)
+        if (origin.includes('exp://') || origin.includes('expo://')) {
+            return callback(null, true);
+        }
+        // Allow local network IPs for development (192.168.x.x, 10.x.x.x, etc.)
+        if (process.env.NODE_ENV !== 'production') {
+            const localNetworkPattern = /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|localhost|127\.0\.0\.1)/;
+            if (localNetworkPattern.test(origin)) {
+                return callback(null, true);
+            }
+        }
+        // For production, you might want to be more strict
+        // For now, allow all origins (can be restricted later with proper auth)
+        callback(null, true);
+    },
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    credentials: true,
+    allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"],
+    exposedHeaders: ["Content-Length", "Content-Range"]
 }));
 app.use(express.json());
 // Add rate limiting status endpoint
@@ -61,7 +90,23 @@ app.get('/api/rate-limit-status', (req, res) => {
     res.json({
         rateLimit: status,
         message: `Current API usage: ${status.currentRequests}/${status.maxRequests} requests per ${status.timeWindow / 1000}s window`,
-        queueLength: status.queueLength
+        queueLength: status.queueLength,
+        poolStatus: connectionPool.getPoolStatus()
+    });
+});
+// Add connection pool status endpoint
+app.get('/api/pool-status', (req, res) => {
+    res.json({
+        poolStatus: connectionPool.getPoolStatus(),
+        message: 'Connection pool status'
+    });
+});
+// Add socket connection test endpoint
+app.get('/api/socket-test', (req, res) => {
+    res.json({
+        socketConnections: io.engine.clientsCount,
+        sessions: socketToSession.size,
+        message: 'Socket.IO status'
     });
 });
 class MCPBackendService {
@@ -78,7 +123,16 @@ class MCPBackendService {
         this.anthropic = new Anthropic({
             apiKey: anthropicApiKey,
         });
-        this.mcp = new Client({ name: "mcp-client-web", version: "1.0.0" });
+        this.mcp = new Client({
+            name: "mcp-client-web",
+            version: "1.0.0",
+            capabilities: {
+                tools: {},
+                resources: {},
+                prompts: {},
+                elicitation: {} // Enable elicitation support for interactive workflows
+            }
+        });
         this.contextManager = new ContextManager();
         // Start auto-connection process using external function
         initializeAutoConnect(this, MCP_SERVER_PATH);
@@ -277,7 +331,7 @@ Current conversation context:
             });
             // Use rate limiting and retry logic for API calls
             const response = await globalRateLimiter.execute(() => RetryManager.retryWithExponentialBackoff(() => this.anthropic.messages.create({
-                model: "claude-3-5-sonnet-20241022",
+                model: ANTHROPIC_MODEL,
                 max_tokens: maxTokens,
                 system: contextualSystemPrompt,
                 messages,
@@ -587,7 +641,7 @@ Current conversation context:
             try {
                 // Get Claude's streaming response to the tool results
                 const response = await globalRateLimiter.execute(() => RetryManager.retryWithExponentialBackoff(() => this.anthropic.messages.create({
-                    model: "claude-3-5-sonnet-20241022",
+                    model: ANTHROPIC_MODEL,
                     max_tokens: maxTokens,
                     system: systemPrompt,
                     messages: currentMessages,
@@ -911,35 +965,157 @@ async function connectToServer(mcpServiceInstance, serverScriptPath) {
 const mcpService = new MCPBackendService();
 // Store session mappings for socket connections
 const socketToSession = new Map();
+// Connection pool for handling multiple users
+class MCPConnectionPool {
+    pool = new Map();
+    maxConnections = 25; // Increased for 25+ employee organizations
+    connectionQueue = [];
+    connectionTimeout = 300000; // 5 minutes timeout
+    lastActivity = new Map();
+    async getConnection(sessionId) {
+        // Check if we already have a connection for this session
+        if (this.pool.has(sessionId)) {
+            const connection = this.pool.get(sessionId);
+            // Update last activity
+            this.lastActivity.set(sessionId, Date.now());
+            return connection;
+        }
+        // Check if we can create a new connection
+        if (this.pool.size < this.maxConnections) {
+            const connection = new MCPBackendService();
+            this.pool.set(sessionId, connection);
+            this.lastActivity.set(sessionId, Date.now());
+            return connection;
+        }
+        // Try to clean up inactive connections first
+        await this.cleanupInactiveConnections();
+        // Check again after cleanup
+        if (this.pool.size < this.maxConnections) {
+            const connection = new MCPBackendService();
+            this.pool.set(sessionId, connection);
+            this.lastActivity.set(sessionId, Date.now());
+            return connection;
+        }
+        // Wait for a connection to become available
+        return new Promise((resolve, reject) => {
+            this.connectionQueue.push({ resolve, reject });
+        });
+    }
+    async releaseConnection(sessionId) {
+        const connection = this.pool.get(sessionId);
+        if (connection) {
+            // Clean up the connection
+            await connection.cleanup();
+            this.pool.delete(sessionId);
+            this.lastActivity.delete(sessionId);
+            // Process queued requests
+            if (this.connectionQueue.length > 0) {
+                const nextRequest = this.connectionQueue.shift();
+                if (nextRequest) {
+                    const newConnection = new MCPBackendService();
+                    this.pool.set(sessionId, newConnection);
+                    this.lastActivity.set(sessionId, Date.now());
+                    nextRequest.resolve(newConnection);
+                }
+            }
+        }
+    }
+    async cleanupInactiveConnections() {
+        const now = Date.now();
+        const inactiveSessions = [];
+        // Find inactive connections
+        for (const [sessionId, lastActivity] of this.lastActivity.entries()) {
+            if (now - lastActivity > this.connectionTimeout) {
+                inactiveSessions.push(sessionId);
+            }
+        }
+        // Clean up inactive connections
+        for (const sessionId of inactiveSessions) {
+            await this.releaseConnection(sessionId);
+        }
+        if (inactiveSessions.length > 0) {
+            console.log(`🧹 Cleaned up ${inactiveSessions.length} inactive connections`);
+        }
+    }
+    getPoolStatus() {
+        return {
+            activeConnections: this.pool.size,
+            maxConnections: this.maxConnections,
+            queuedRequests: this.connectionQueue.length,
+            inactiveConnections: Array.from(this.lastActivity.entries())
+                .filter(([_, lastActivity]) => Date.now() - lastActivity > this.connectionTimeout).length
+        };
+    }
+}
+const connectionPool = new MCPConnectionPool();
+// Periodic cleanup of inactive connections (every 2 minutes)
+setInterval(async () => {
+    try {
+        await connectionPool['cleanupInactiveConnections']();
+    }
+    catch (error) {
+        console.error('Error during periodic connection cleanup:', error);
+    }
+}, 120000); // 2 minutes
 // Socket.IO connection handling
 io.on('connection', async (socket) => {
+    console.log(`🔌 New socket connection: ${socket.id}`);
     // Create or retrieve session for this socket
     const sessionId = randomUUID();
     socketToSession.set(socket.id, sessionId);
-    // Create session in Redis with optimized context manager
-    await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
-    // Send current connection status
-    const connectionStatus = mcpService.getConnectionStatus();
-    socket.emit('connection_status', connectionStatus);
-    // If already connected via auto-connect, send success message
-    if (connectionStatus.isConnected) {
-        socket.emit('connection_success', {
-            message: 'Connected to MCP server',
-            tools: connectionStatus.tools
+    try {
+        console.log(`📋 Setting up session: ${sessionId} for socket: ${socket.id}`);
+        // Get connection for this session
+        const mcpService = await connectionPool.getConnection(sessionId);
+        console.log(`✅ Got MCP service for session: ${sessionId}`);
+        // Create session in Redis with optimized context manager
+        await mcpService['contextManager'].createSession(sessionId, `user_${socket.id}`);
+        console.log(`✅ Created Redis session for: ${sessionId}`);
+        // Send current connection status
+        const connectionStatus = mcpService.getConnectionStatus();
+        console.log(`📊 Connection status for ${sessionId}:`, connectionStatus);
+        socket.emit('connection_status', connectionStatus);
+        // If already connected via auto-connect, send success message
+        if (connectionStatus.isConnected) {
+            console.log(`🎉 MCP server connected for session: ${sessionId}`);
+            socket.emit('connection_success', {
+                message: 'Connected to MCP server',
+                tools: connectionStatus.tools
+            });
+        }
+        else {
+            console.log(`⏳ MCP server not yet connected for session: ${sessionId}`);
+            socket.emit('connection_pending', {
+                message: 'Connecting to MCP server...',
+                autoConnectRetries: mcpService['autoConnectRetries']
+            });
+        }
+    }
+    catch (error) {
+        console.error(`❌ Error setting up socket connection for ${sessionId}:`, error);
+        socket.emit('connection_error', {
+            message: error instanceof Error ? error.message : 'Failed to setup connection'
         });
     }
     // Keep manual connection handler for fallback/reconnection
     socket.on('connect_server', async (data) => {
         try {
+            const sessionId = socketToSession.get(socket.id);
+            if (!sessionId) {
+                socket.emit('connection_error', { message: 'Session not found' });
+                return;
+            }
             const { serverPath } = data;
             socket.emit('connection_progress', { status: 'connecting', message: 'Connecting to MCP server...' });
+            const mcpService = await connectionPool.getConnection(sessionId);
             const result = await connectToServer(mcpService, serverPath);
             socket.emit('connection_success', {
                 message: `Successfully connected to ${serverPath}`,
                 tools: result.tools
             });
             // Broadcast to all clients that server is connected
-            io.emit('connection_status', mcpService.getConnectionStatus());
+            const connectionStatus = mcpService.getConnectionStatus();
+            io.emit('connection_status', connectionStatus);
         }
         catch (error) {
             socket.emit('connection_error', {
@@ -964,6 +1140,8 @@ io.on('connection', async (socket) => {
                 status: 'processing',
                 message: 'Processing your query...'
             });
+            // Get connection for this session
+            const mcpService = await connectionPool.getConnection(sessionId);
             // Use streaming version
             await mcpService.processQueryStream(query, sessionId, (chunk) => {
                 socket.emit('query_stream', {
@@ -987,6 +1165,7 @@ io.on('connection', async (socket) => {
                 socket.emit('context_error', { message: 'Session not found' });
                 return;
             }
+            const mcpService = await connectionPool.getConnection(sessionId);
             const context = await mcpService['contextManager'].getSession(sessionId);
             socket.emit('context_response', {
                 messages: context?.messages || [],
@@ -1008,46 +1187,144 @@ io.on('connection', async (socket) => {
         if (sessionId) {
             console.log(`🧹 Cleaned up session ${sessionId} for socket ${socket.id}`);
             socketToSession.delete(socket.id);
+            await connectionPool.releaseConnection(sessionId);
         }
     });
 });
 // REST API endpoints (alternative to WebSocket)
-app.get('/api/status', (req, res) => {
-    const status = mcpService.getConnectionStatus();
-    res.json({
-        ...status,
-        autoConnectRetries: mcpService['autoConnectRetries'],
-        maxAutoConnectRetries: mcpService['maxAutoConnectRetries']
-    });
+app.get('/api/status', async (req, res) => {
+    try {
+        const sessionId = req.query.sessionId || randomUUID();
+        const mcpService = await connectionPool.getConnection(sessionId);
+        const status = mcpService.getConnectionStatus();
+        res.json({
+            ...status,
+            autoConnectRetries: mcpService['autoConnectRetries'],
+            maxAutoConnectRetries: mcpService['maxAutoConnectRetries'],
+            poolStatus: connectionPool.getPoolStatus()
+        });
+    }
+    catch (error) {
+        res.status(500).json({
+            error: error instanceof Error ? error.message : 'Failed to get status',
+            poolStatus: connectionPool.getPoolStatus()
+        });
+    }
+});
+// Conversation API endpoints
+app.get('/api/conversations', async (req, res) => {
+    try {
+        const userId = req.query.userId;
+        if (!userId)
+            return res.status(400).json({ error: 'Missing userId' });
+        const conversations = await getConversations(userId);
+        res.json({ conversations });
+    }
+    catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch conversations' });
+    }
+});
+// Get a single conversation
+app.get('/api/conversations/:sessionId', async (req, res) => {
+    try {
+        const userId = req.query.userId;
+        const sessionId = req.params.sessionId;
+        if (!userId || !sessionId) {
+            return res.status(400).json({ error: 'Missing userId or sessionId' });
+        }
+        const conversation = await getConversation(userId, sessionId);
+        if (!conversation) {
+            return res.status(404).json({ error: 'Conversation not found' });
+        }
+        res.json({ conversation });
+    }
+    catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to fetch conversation' });
+    }
+});
+app.post('/api/conversations', async (req, res) => {
+    try {
+        const { userId, sessionId, messages, title } = req.body;
+        if (!userId || !sessionId || !Array.isArray(messages)) {
+            return res.status(400).json({ error: 'Missing userId, sessionId, or messages' });
+        }
+        await saveConversation(userId, sessionId, messages, title);
+        res.json({ success: true });
+    }
+    catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to save conversation' });
+    }
+});
+app.delete('/api/conversations', async (req, res) => {
+    try {
+        const { userId, sessionId } = req.body;
+        if (!userId || !sessionId) {
+            return res.status(400).json({ error: 'Missing userId or sessionId' });
+        }
+        await deleteConversation(userId, sessionId);
+        res.json({ success: true });
+    }
+    catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to delete conversation' });
+    }
+});
+// NEW: Update conversation title endpoint
+app.put('/api/conversations/title', async (req, res) => {
+    try {
+        const { userId, sessionId, title } = req.body;
+        if (!userId || !sessionId || !title) {
+            return res.status(400).json({ error: 'Missing userId, sessionId, or title' });
+        }
+        await updateConversationTitle(userId, sessionId, title);
+        res.json({ success: true });
+    }
+    catch (error) {
+        res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to update conversation title' });
+    }
 });
 // Keep manual connect endpoint for fallback/reconnection
 app.post('/api/connect', async (req, res) => {
     try {
-        const { serverPath } = req.body;
+        const { serverPath, sessionId } = req.body;
+        const tempSessionId = sessionId || randomUUID();
+        const mcpService = await connectionPool.getConnection(tempSessionId);
         const result = await connectToServer(mcpService, serverPath);
         res.json({
             success: true,
             tools: result.tools,
-            message: 'Manual connection successful'
+            message: 'Manual connection successful',
+            sessionId: tempSessionId
         });
     }
     catch (error) {
         res.status(500).json({
             success: false,
             error: error instanceof Error ? error.message : 'Connection failed',
-            autoConnectRetries: mcpService['autoConnectRetries']
+            poolStatus: connectionPool.getPoolStatus()
         });
     }
 });
 // Add health check endpoint
-app.get('/api/health', (req, res) => {
-    const status = mcpService.getConnectionStatus();
-    res.json({
-        status: status.isConnected ? 'healthy' : 'unhealthy',
-        connected: status.isConnected,
-        tools: status.tools,
-        autoConnectRetries: mcpService['autoConnectRetries']
-    });
+app.get('/api/health', async (req, res) => {
+    try {
+        const sessionId = req.query.sessionId || randomUUID();
+        const mcpService = await connectionPool.getConnection(sessionId);
+        const status = mcpService.getConnectionStatus();
+        res.json({
+            status: status.isConnected ? 'healthy' : 'unhealthy',
+            connected: status.isConnected,
+            tools: status.tools,
+            autoConnectRetries: mcpService['autoConnectRetries'],
+            poolStatus: connectionPool.getPoolStatus()
+        });
+    }
+    catch (error) {
+        res.status(500).json({
+            status: 'unhealthy',
+            error: error instanceof Error ? error.message : 'Health check failed',
+            poolStatus: connectionPool.getPoolStatus()
+        });
+    }
 });
 // NEW: Server-Sent Events endpoint for streaming
 app.get('/api/query-stream', async (req, res) => {
@@ -1064,8 +1341,9 @@ app.get('/api/query-stream', async (req, res) => {
         'Access-Control-Allow-Headers': 'Cache-Control'
     });
     const tempSessionId = randomUUID();
-    await mcpService['contextManager'].createSession(tempSessionId, 'sse_user');
     try {
+        const mcpService = await connectionPool.getConnection(tempSessionId);
+        await mcpService['contextManager'].createSession(tempSessionId, 'sse_user');
         await mcpService.processQueryStream(query, tempSessionId, (chunk) => {
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
         });
@@ -1076,14 +1354,19 @@ app.get('/api/query-stream', async (req, res) => {
             error: error instanceof Error ? error.message : 'Unknown error'
         })}\n\n`);
     }
-    res.end();
+    finally {
+        // Clean up the connection
+        await connectionPool.releaseConnection(tempSessionId);
+        res.end();
+    }
 });
 // REPLACE with streaming version for /api/query
 app.post('/api/query', async (req, res) => {
+    const tempSessionId = randomUUID();
     try {
         const { query } = req.body;
         // Create a temporary session for REST API queries
-        const tempSessionId = randomUUID();
+        const mcpService = await connectionPool.getConnection(tempSessionId);
         await mcpService['contextManager'].createSession(tempSessionId, 'rest_api_user');
         let fullResponse = '';
         let errorOccurred = false;
@@ -1109,11 +1392,17 @@ app.post('/api/query', async (req, res) => {
             error: error instanceof Error ? error.message : 'Query processing failed'
         });
     }
+    finally {
+        // Clean up the connection
+        await connectionPool.releaseConnection(tempSessionId);
+    }
 });
 // Graceful shutdown
 process.on('SIGINT', async () => {
     console.log('\nShutting down gracefully...');
-    await mcpService.cleanup();
+    // Clean up all connections in the pool
+    const poolStatus = connectionPool.getPoolStatus();
+    console.log(`Cleaning up ${poolStatus.activeConnections} active connections...`);
     httpServer.close(() => {
         console.log('Server closed');
         process.exit(0);
@@ -1121,14 +1410,16 @@ process.on('SIGINT', async () => {
 });
 process.on('SIGTERM', async () => {
     console.log('\nShutting down gracefully...');
-    await mcpService.cleanup();
+    // Clean up all connections in the pool
+    const poolStatus = connectionPool.getPoolStatus();
+    console.log(`Cleaning up ${poolStatus.activeConnections} active connections...`);
     httpServer.close(() => {
         console.log('Server closed');
         process.exit(0);
     });
 });
-const PORT = process.env.PORT || 8080;
-httpServer.listen(PORT, () => {
+const PORT = parseInt(process.env.PORT || '8080', 10);
+httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 MCP Backend Service running on port ${PORT}`);
     console.log(`📡 WebSocket endpoint: ws://localhost:${PORT}`);
     console.log(`🔗 REST API endpoint: http://localhost:${PORT}/api`);

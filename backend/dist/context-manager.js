@@ -161,8 +161,8 @@ export class ContextManager {
         if (context.toolUsageHistory.length > this.maxToolHistory) {
             context.toolUsageHistory = context.toolUsageHistory.slice(-this.maxToolHistory);
         }
-        // Update active entities
-        this.updateActiveEntities(context, toolName, result);
+        // Update active entities with args for pagination context
+        this.updateActiveEntities(context, toolName, result, args);
         context.lastActivity = Date.now();
         await this.saveContext(sessionId, context);
         // Cache result separately for quick access
@@ -224,12 +224,13 @@ export class ContextManager {
         return ids.slice(0, 5); // Keep max 5 IDs
     }
     // Update active entities efficiently
-    updateActiveEntities(context, toolName, result) {
+    updateActiveEntities(context, toolName, result, args) {
         try {
             const content = result.content?.[0]?.text;
             console.log('updateActiveEntities toolName:', toolName);
             console.log('updateActiveEntities raw result:', JSON.stringify(result));
             console.log('updateActiveEntities content:', content);
+            console.log('updateActiveEntities args:', args);
             if (!content)
                 return;
             let data = null;
@@ -301,6 +302,60 @@ export class ContextManager {
                     context.activeEntities.lastUpdated = Date.now();
                 }
             }
+            // Handle pagination context for task list tools
+            if (toolName === 'getTaskList' || toolName === 'getNextPageTasks') {
+                if (args) {
+                    context.activeEntities.currentPage = args.page || args.current_page || 1;
+                    context.activeEntities.currentEmployee = args.employee_name;
+                    context.activeEntities.currentSearch = args.search;
+                    context.activeEntities.currentFilter = args.filter;
+                    context.activeEntities.lastToolUsed = toolName;
+                    context.activeEntities.lastToolArgs = args;
+                    context.activeEntities.lastUpdated = Date.now();
+                    // Extract total pages from result if available
+                    try {
+                        const jsonMatch = content.match(/\{[\s\S]*\}/);
+                        if (jsonMatch) {
+                            const data = JSON.parse(jsonMatch[0]);
+                            if (data && typeof data === 'object') {
+                                // Look for pagination info in the response text
+                                const pageMatch = content.match(/Page (\d+) of (\d+)/);
+                                if (pageMatch) {
+                                    context.activeEntities.currentPage = parseInt(pageMatch[1]);
+                                    context.activeEntities.totalPages = parseInt(pageMatch[2]);
+                                }
+                            }
+                        }
+                    }
+                    catch (e) {
+                        console.log('Failed to extract pagination info from result');
+                    }
+                }
+            }
+            // Handle task details context
+            if (toolName === 'getTaskDetails') {
+                if (args) {
+                    context.activeEntities.lastToolUsed = toolName;
+                    context.activeEntities.lastToolArgs = args;
+                    context.activeEntities.lastUpdated = Date.now();
+                    // Extract task information from result
+                    try {
+                        const jsonMatch = content.match(/\{[\s\S]*\}/);
+                        if (jsonMatch) {
+                            const data = JSON.parse(jsonMatch[0]);
+                            if (data && data.task_id) {
+                                // Store task context for potential follow-up requests
+                                context.activeEntities.currentTaskId = data.task_id;
+                                context.activeEntities.currentTaskNumber = data.custom_number;
+                                context.activeEntities.currentTaskTitle = data.title;
+                            }
+                        }
+                    }
+                    catch (e) {
+                        console.log('Failed to extract task details from result');
+                    }
+                }
+            }
         }
         catch (e) {
             // Ignore parsing errors
@@ -322,10 +377,21 @@ export class ContextManager {
             .filter(m => m.role === 'user')
             .map(m => m.content.substring(0, 100)); // Limit query length
         const userIntent = this.detectIntent([...recentQueries, currentQuery]);
+        // Add explicit pagination context for better AI understanding
+        const paginationContext = {
+            currentPage: context.activeEntities.currentPage,
+            totalPages: context.activeEntities.totalPages,
+            currentEmployee: context.activeEntities.currentEmployee,
+            currentSearch: context.activeEntities.currentSearch,
+            currentFilter: context.activeEntities.currentFilter,
+            lastToolUsed: context.activeEntities.lastToolUsed,
+            hasPaginationContext: !!(context.activeEntities.currentPage || context.activeEntities.currentEmployee)
+        };
         return {
             recentQueries: [...recentQueries, currentQuery],
             activeEntities: context.activeEntities,
             userIntent,
+            paginationContext,
         };
     }
     // Simplified argument enhancement
@@ -361,6 +427,46 @@ export class ContextManager {
                 if (!enhancedArgs.product_id && hasReference && context.activeEntities.productId) {
                     enhancedArgs.product_id = context.activeEntities.productId;
                     console.log(`🧠 Auto-filled product_id: ${context.activeEntities.productId}`);
+                }
+                break;
+            case 'getNextPageTasks':
+                // Auto-fill pagination context for next page requests
+                if (context.activeEntities.lastToolUsed === 'getTaskList' || context.activeEntities.lastToolUsed === 'getNextPageTasks') {
+                    if (!enhancedArgs.current_page && context.activeEntities.currentPage) {
+                        enhancedArgs.current_page = context.activeEntities.currentPage;
+                        console.log(`🧠 Auto-filled current_page: ${context.activeEntities.currentPage}`);
+                    }
+                    if (!enhancedArgs.employee_name && context.activeEntities.currentEmployee) {
+                        enhancedArgs.employee_name = context.activeEntities.currentEmployee;
+                        console.log(`🧠 Auto-filled employee_name: ${context.activeEntities.currentEmployee}`);
+                    }
+                    if (!enhancedArgs.search && context.activeEntities.currentSearch) {
+                        enhancedArgs.search = context.activeEntities.currentSearch;
+                        console.log(`🧠 Auto-filled search: ${context.activeEntities.currentSearch}`);
+                    }
+                    if (!enhancedArgs.filter && context.activeEntities.currentFilter) {
+                        enhancedArgs.filter = context.activeEntities.currentFilter;
+                        console.log(`🧠 Auto-filled filter: ${context.activeEntities.currentFilter}`);
+                    }
+                }
+                break;
+            case 'getTaskList':
+                // Store context for potential next page requests
+                if (enhancedArgs.employee_name) {
+                    context.activeEntities.currentEmployee = enhancedArgs.employee_name;
+                }
+                if (enhancedArgs.search) {
+                    context.activeEntities.currentSearch = enhancedArgs.search;
+                }
+                if (enhancedArgs.filter) {
+                    context.activeEntities.currentFilter = enhancedArgs.filter;
+                }
+                break;
+            case 'getTaskDetails':
+                // Auto-fill task context for follow-up requests
+                if (!enhancedArgs.task_id && !enhancedArgs.custom_number && context.activeEntities.currentTaskId) {
+                    enhancedArgs.task_id = parseInt(context.activeEntities.currentTaskId);
+                    console.log(`🧠 Auto-filled task_id: ${context.activeEntities.currentTaskId}`);
                 }
                 break;
         }

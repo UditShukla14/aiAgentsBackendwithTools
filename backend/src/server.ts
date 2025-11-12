@@ -38,7 +38,7 @@ if (!anthropicApiKey) {
 const anthropic = new Anthropic({ apiKey: anthropicApiKey });
 
 // Model name configuration - default to standard Claude 3.5 Sonnet
-const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-haiku-20240307";
+const ANTHROPIC_MODEL = "claude-3-haiku-20240307";
 
 async function generateSummaryWithClaude(chartJson: any) {
   const prompt = `
@@ -65,7 +65,34 @@ const io = new SocketIOServer(httpServer, {
 });
 
 app.use(cors({
-  origin: allowedOrigins,
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps, Postman, curl)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    // Check if origin is in allowed list
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // Allow Expo origins (exp://, expo://)
+    if (origin.includes('exp://') || origin.includes('expo://')) {
+      return callback(null, true);
+    }
+    
+    // Allow local network IPs for development (192.168.x.x, 10.x.x.x, etc.)
+    if (process.env.NODE_ENV !== 'production') {
+      const localNetworkPattern = /^https?:\/\/(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[01])\.|localhost|127\.0\.0\.1)/;
+      if (localNetworkPattern.test(origin)) {
+        return callback(null, true);
+      }
+    }
+    
+    // For production, you might want to be more strict
+    // For now, allow all origins (can be restricted later with proper auth)
+    callback(null, true);
+  },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   credentials: true,
   allowedHeaders: ["DNT", "User-Agent", "X-Requested-With", "If-Modified-Since", "Cache-Control", "Content-Type", "Range", "Authorization"],
@@ -123,7 +150,16 @@ class MCPBackendService {
     this.anthropic = new Anthropic({
       apiKey: anthropicApiKey,
     });
-    this.mcp = new Client({ name: "mcp-client-web", version: "1.0.0" });
+    this.mcp = new Client({ 
+      name: "mcp-client-web", 
+      version: "1.0.0",
+      capabilities: {
+        tools: {},
+        resources: {},
+        prompts: {},
+        elicitation: {} // Enable elicitation support for interactive workflows
+      }
+    });
     this.contextManager = new ContextManager();
     // Start auto-connection process using external function
     initializeAutoConnect(this, MCP_SERVER_PATH);
@@ -667,6 +703,59 @@ private async processToolCallsWithStreaming(
     }
   }
 
+  // Check if tool results contain formatted content with tags (<table>, <card>, <chart>, <text>)
+  const CUSTOM_TAGS = ['<table>', '<card>', '<chart>', '<text>'];
+  const hasFormattedContent = toolResults.some(result => 
+    result.content.some((content: any) => {
+      if (content.type === "text") {
+        return CUSTOM_TAGS.some(tag => content.text.includes(tag));
+      }
+      return false;
+    })
+  );
+
+  // If tool results already have formatted tags (from search/product tools),
+  // extract and send directly WITHOUT asking Claude to respond again
+  if (hasFormattedContent) {
+    const formattedContent = toolResults
+      .flatMap(result => result.content)
+      .filter((content: any) => content.type === "text" && CUSTOM_TAGS.some(tag => content.text.includes(tag)))
+      .map((content: any) => content.text)
+      .join("\n\n");
+    
+    if (formattedContent) {
+      // Stream the formatted content with tags
+      const lines = formattedContent.split('\n');
+      let accumulated = '';
+      
+      for (const line of lines) {
+        accumulated += line + '\n';
+        onChunk({
+          type: 'text_delta',
+          delta: line + '\n',
+          accumulated: accumulated.trim(),
+          isFormatted: true
+        });
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      
+      await this.contextManager.addMessage(
+        sessionId, 
+        'assistant', 
+        filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
+        toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+      );
+      
+      onChunk({
+        type: 'complete',
+        response: filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
+        toolsUsed: toolUsageLog,
+        skipClaudeResponse: true
+      });
+      return;
+    }
+  }
+
   // Add tool results to the conversation
   currentMessages.push({
     role: "user",
@@ -942,6 +1031,58 @@ private async continueStreamingConversation(
           content: result.content || [{ type: "text", text: JSON.stringify(result) }],
           is_error: result.isError || false,
         });
+      }
+
+      // Check if tool results contain formatted content with tags (<table>, <card>, <chart>, <text>)
+      const CUSTOM_TAGS_V2 = ['<table>', '<card>', '<chart>', '<text>'];
+      const hasFormattedContent2 = toolResults.some(result => 
+        result.content.some((content: any) => {
+          if (content.type === "text") {
+            return CUSTOM_TAGS_V2.some(tag => content.text.includes(tag));
+          }
+          return false;
+        })
+      );
+
+      // If tool results already have formatted tags, send directly WITHOUT Claude response
+      if (hasFormattedContent2) {
+        const formattedContent = toolResults
+          .flatMap(result => result.content)
+          .filter((content: any) => content.type === "text" && CUSTOM_TAGS_V2.some(tag => content.text.includes(tag)))
+          .map((content: any) => content.text)
+          .join("\n\n");
+        
+        if (formattedContent) {
+          // Stream the formatted content with tags
+          const lines = formattedContent.split('\n');
+          let accumulated = '';
+          
+          for (const line of lines) {
+            accumulated += line + '\n';
+            onChunk({
+              type: 'text_delta',
+              delta: line + '\n',
+              accumulated: accumulated.trim(),
+              isFormatted: true
+            });
+            await new Promise(resolve => setTimeout(resolve, 5));
+          }
+          
+          await this.contextManager.addMessage(
+            sessionId, 
+            'assistant', 
+            filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
+            toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
+          );
+          
+          onChunk({
+            type: 'complete',
+            response: filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
+            toolsUsed: toolUsageLog,
+            skipClaudeResponse: true
+          });
+          return;
+        }
       }
 
       // Add tool results to the conversation
