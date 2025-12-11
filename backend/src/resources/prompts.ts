@@ -4,8 +4,8 @@
  * Pattern: Separation of concerns, functions over constants, utility functions
  */
 
-import { WORK_DIR, allowedHTMLElements, CUSTOM_TAGS, TOOLS, ERROR_MESSAGES } from './constants';
-import { stripIndents } from './stripindents';
+import { WORK_DIR, allowedHTMLElements, CUSTOM_TAGS, TOOLS, ERROR_MESSAGES } from './constants.js';
+import { stripIndents } from './stripindents.js';
 
 /**
  * BASE_PROMPT - Quick reference for all interactions

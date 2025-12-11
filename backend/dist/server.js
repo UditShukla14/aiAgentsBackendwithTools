@@ -597,6 +597,46 @@ Current conversation context:
                 }
             }
         }
+        // Check if tool results contain formatted content with tags (<table>, <card>, <chart>, <text>)
+        const CUSTOM_TAGS = ['<table>', '<card>', '<chart>', '<text>'];
+        const hasFormattedContent = toolResults.some(result => result.content.some((content) => {
+            if (content.type === "text") {
+                return CUSTOM_TAGS.some(tag => content.text.includes(tag));
+            }
+            return false;
+        }));
+        // If tool results already have formatted tags (from search/product tools),
+        // extract and send directly WITHOUT asking Claude to respond again
+        if (hasFormattedContent) {
+            const formattedContent = toolResults
+                .flatMap(result => result.content)
+                .filter((content) => content.type === "text" && CUSTOM_TAGS.some(tag => content.text.includes(tag)))
+                .map((content) => content.text)
+                .join("\n\n");
+            if (formattedContent) {
+                // Stream the formatted content with tags
+                const lines = formattedContent.split('\n');
+                let accumulated = '';
+                for (const line of lines) {
+                    accumulated += line + '\n';
+                    onChunk({
+                        type: 'text_delta',
+                        delta: line + '\n',
+                        accumulated: accumulated.trim(),
+                        isFormatted: true
+                    });
+                    await new Promise(resolve => setTimeout(resolve, 5));
+                }
+                await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(), toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined);
+                onChunk({
+                    type: 'complete',
+                    response: filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
+                    toolsUsed: toolUsageLog,
+                    skipClaudeResponse: true
+                });
+                return;
+            }
+        }
         // Add tool results to the conversation
         currentMessages.push({
             role: "user",
@@ -815,6 +855,45 @@ Current conversation context:
                         content: result.content || [{ type: "text", text: JSON.stringify(result) }],
                         is_error: result.isError || false,
                     });
+                }
+                // Check if tool results contain formatted content with tags (<table>, <card>, <chart>, <text>)
+                const CUSTOM_TAGS_V2 = ['<table>', '<card>', '<chart>', '<text>'];
+                const hasFormattedContent2 = toolResults.some(result => result.content.some((content) => {
+                    if (content.type === "text") {
+                        return CUSTOM_TAGS_V2.some(tag => content.text.includes(tag));
+                    }
+                    return false;
+                }));
+                // If tool results already have formatted tags, send directly WITHOUT Claude response
+                if (hasFormattedContent2) {
+                    const formattedContent = toolResults
+                        .flatMap(result => result.content)
+                        .filter((content) => content.type === "text" && CUSTOM_TAGS_V2.some(tag => content.text.includes(tag)))
+                        .map((content) => content.text)
+                        .join("\n\n");
+                    if (formattedContent) {
+                        // Stream the formatted content with tags
+                        const lines = formattedContent.split('\n');
+                        let accumulated = '';
+                        for (const line of lines) {
+                            accumulated += line + '\n';
+                            onChunk({
+                                type: 'text_delta',
+                                delta: line + '\n',
+                                accumulated: accumulated.trim(),
+                                isFormatted: true
+                            });
+                            await new Promise(resolve => setTimeout(resolve, 5));
+                        }
+                        await this.contextManager.addMessage(sessionId, 'assistant', filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(), toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined);
+                        onChunk({
+                            type: 'complete',
+                            response: filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
+                            toolsUsed: toolUsageLog,
+                            skipClaudeResponse: true
+                        });
+                        return;
+                    }
                 }
                 // Add tool results to the conversation
                 currentMessages.push({
