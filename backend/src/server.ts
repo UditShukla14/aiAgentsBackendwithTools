@@ -135,6 +135,33 @@ interface AnthropicTool {
   input_schema: any;
 }
 
+// Helper function to recursively remove ID fields from data before sending to AI
+function removeIdFields(obj: any): any {
+  if (Array.isArray(obj)) {
+    return obj.map(item => removeIdFields(item));
+  } else if (obj !== null && typeof obj === 'object') {
+    const sanitized: any = {};
+    const idFields = [
+      'id', 'customer_id', 'product_id', 'invoice_id', 'estimate_id', 
+      'user_id', 'quickbook_customer_id', 'handshake_key', 
+      'assign_employee_user_id', 'quotation_id', 'task_id',
+      'warehouse_id', 'address_id', 'address_company_id',
+      'customer_user_id', 'pipeline_id', 'stage_id',
+      'created_by', 'updated_by', 'assign_to', 'created_from',
+      'onboarded_by', 'imp_session_id'
+    ];
+    
+    for (const [key, value] of Object.entries(obj)) {
+      // Skip ID fields (case-insensitive check)
+      if (!idFields.includes(key.toLowerCase())) {
+        sanitized[key] = removeIdFields(value);
+      }
+    }
+    return sanitized;
+  }
+  return obj;
+}
+
 class MCPBackendService {
   public mcp: Client;
   public anthropic: Anthropic;
@@ -602,11 +629,14 @@ private async processToolCallsWithStreaming(
 
     // Check cache first
     let result = null;
-    if (toolName !== 'analyzeBusinessData') {
+    if (toolName === 'date-utility') {
+      // Skip cache for date-utility (always needs fresh calculation)
+      result = null;
+    } else {
       result = await this.contextManager.getCachedResult(toolName, originalArgs || {});
     }
     
-    if (!result || toolName === 'date-utility') { // Skip cache for date-utility and analytics
+    if (!result) {
       // Enhance tool arguments with context
       const enhancedArgs = await this.contextManager.enhanceToolArguments(
         sessionId,
@@ -626,10 +656,10 @@ private async processToolCallsWithStreaming(
         
         console.log("Tool result:", JSON.stringify(result, null, 2));
         
-        // Cache the result (but NOT for analyzeBusinessData)
+        // Cache the result
         const cacheTime = toolName.includes('search') ? 300 : 
                          toolName === 'date-utility' ? 0 : 3600; // Don't cache date-utility
-        if (cacheTime > 0 && toolName !== 'analyzeBusinessData') {
+        if (cacheTime > 0) {
           await this.contextManager.cacheToolResult(toolName, originalArgs || {}, result, cacheTime);
         }
         
@@ -676,138 +706,45 @@ private async processToolCallsWithStreaming(
       content: result.content || [{ type: "text", text: JSON.stringify(result) }],
       is_error: result.isError || false,
     });
-
-    // Special handling for analyzeBusinessData: generate summary and send both chart and summary
-    if (
-      toolName === "analyzeBusinessData" &&
-      result.content &&
-      Array.isArray(result.content) &&
-      result.content[0]?.type === "text"
-    ) {
-      try {
-        const chartJson = JSON.parse(result.content[0].text);
-        onChunk({
-          type: "complete",
-          response: `[DISPLAY_VERBATIM]${JSON.stringify(chartJson, null, 2)}`,
-          toolsUsed: [toolName]
-        });
-        return;
-      } catch (e) {
-        onChunk({
-          type: "complete",
-          response: result.content[0].text,
-          toolsUsed: [toolName]
-        });
-        return;
-      }
-    }
   }
 
-  // Check if tool results contain formatted content with tags (<table>, <card>, <chart>, <text>)
-  const CUSTOM_TAGS = ['<table>', '<card>', '<chart>', '<text>'];
-  const hasFormattedContent = toolResults.some(result => 
-    result.content.some((content: any) => {
+  // ALL tool results go through AI for formatting (no direct pass-through)
+  // Preprocess tool results to remove internal ID fields before sending to AI
+  const sanitizedToolResults = toolResults.map(result => ({
+    ...result,
+    content: result.content.map((content: any) => {
       if (content.type === "text") {
-        return CUSTOM_TAGS.some(tag => content.text.includes(tag));
+        try {
+          // Try to parse and remove ID fields from JSON
+          // Handle both single JSON object and text with JSON
+          const jsonMatch = content.text.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const data = JSON.parse(jsonMatch[0]);
+            const sanitized = removeIdFields(data);
+            // Replace the JSON in the text with sanitized version, preserving any text before/after
+            const beforeJson = content.text.substring(0, jsonMatch.index);
+            const afterJson = content.text.substring(jsonMatch.index! + jsonMatch[0].length);
+            return {
+              ...content,
+              text: beforeJson + JSON.stringify(sanitized, null, 2) + afterJson
+            };
+          }
+        } catch (e) {
+          // If parsing fails, keep original text (but log for debugging)
+          console.warn('Failed to sanitize tool result:', (e as Error).message);
+        }
       }
-      return false;
+      return content;
     })
-  );
+  }));
 
-  // If tool results already have formatted tags (from search/product tools),
-  // extract and send directly WITHOUT asking Claude to respond again
-  if (hasFormattedContent) {
-    const formattedContent = toolResults
-      .flatMap(result => result.content)
-      .filter((content: any) => content.type === "text" && CUSTOM_TAGS.some(tag => content.text.includes(tag)))
-      .map((content: any) => content.text)
-      .join("\n\n");
-    
-    if (formattedContent) {
-      // Stream the formatted content with tags
-      const lines = formattedContent.split('\n');
-      let accumulated = '';
-      
-      for (const line of lines) {
-        accumulated += line + '\n';
-        onChunk({
-          type: 'text_delta',
-          delta: line + '\n',
-          accumulated: accumulated.trim(),
-          isFormatted: true
-        });
-        await new Promise(resolve => setTimeout(resolve, 5));
-      }
-      
-      await this.contextManager.addMessage(
-        sessionId, 
-        'assistant', 
-        filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-        toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
-      );
-      
-      onChunk({
-        type: 'complete',
-        response: filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-        toolsUsed: toolUsageLog,
-        skipClaudeResponse: true
-      });
-      return;
-    }
-  }
-
-  // Add tool results to the conversation
+  // Add sanitized tool results to the conversation for AI to format
   currentMessages.push({
     role: "user",
-    content: toolResults,
+    content: sanitizedToolResults,
   });
 
-  // Check if any tool result has DISPLAY_VERBATIM flag
-  const hasVerbatimFlag = toolResults.some(result => 
-    result.content.some((content: any) => 
-      content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")
-    )
-  );
-
-  // For verbatim content, bypass Claude and return directly
-  if (hasVerbatimFlag) {
-    const verbatimContent = toolResults
-      .flatMap(result => result.content)
-      .filter((content: any) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
-      .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
-      .join("\n\n");
-    
-    // Stream the verbatim content
-    const lines = verbatimContent.split('\n');
-    let accumulated = '';
-    
-    for (const line of lines) {
-      accumulated += line + '\n';
-      onChunk({
-        type: 'text_delta',
-        delta: line + '\n',
-        accumulated: accumulated.trim(),
-        isVerbatim: true
-      });
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-    
-    await this.contextManager.addMessage(
-      sessionId, 
-      'assistant', 
-      filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-      toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
-    );
-    
-    onChunk({
-      type: 'complete',
-      response: filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-      toolsUsed: toolUsageLog
-    });
-    return;
-  }
-
-  // **CRITICAL FIX: Continue processing iteratively like the non-streaming version**
+  // Continue conversation - AI will format the data using <card>, <table>, etc. based on prompt
   await this.continueStreamingConversation(
     currentMessages,
     systemPrompt,
@@ -1033,109 +970,42 @@ private async continueStreamingConversation(
         });
       }
 
-      // Check if tool results contain formatted content with tags (<table>, <card>, <chart>, <text>)
-      const CUSTOM_TAGS_V2 = ['<table>', '<card>', '<chart>', '<text>'];
-      const hasFormattedContent2 = toolResults.some(result => 
-        result.content.some((content: any) => {
+      // ALL tool results go through AI for formatting (no static handling)
+      // Preprocess tool results to remove internal ID fields before sending to AI
+      const sanitizedToolResults = toolResults.map(result => ({
+        ...result,
+        content: result.content.map((content: any) => {
           if (content.type === "text") {
-            return CUSTOM_TAGS_V2.some(tag => content.text.includes(tag));
+            try {
+              // Try to parse and remove ID fields from JSON
+              const jsonMatch = content.text.match(/\{[\s\S]*\}/);
+              if (jsonMatch) {
+                const data = JSON.parse(jsonMatch[0]);
+                const sanitized = removeIdFields(data);
+                // Replace the JSON in the text with sanitized version, preserving any text before/after
+                const beforeJson = content.text.substring(0, jsonMatch.index);
+                const afterJson = content.text.substring(jsonMatch.index! + jsonMatch[0].length);
+                return {
+                  ...content,
+                  text: beforeJson + JSON.stringify(sanitized, null, 2) + afterJson
+                };
+              }
+            } catch (e) {
+              // If parsing fails, keep original text (but log for debugging)
+              console.warn('Failed to sanitize tool result:', (e as Error).message);
+            }
           }
-          return false;
+          return content;
         })
-      );
+      }));
 
-      // If tool results already have formatted tags, send directly WITHOUT Claude response
-      if (hasFormattedContent2) {
-        const formattedContent = toolResults
-          .flatMap(result => result.content)
-          .filter((content: any) => content.type === "text" && CUSTOM_TAGS_V2.some(tag => content.text.includes(tag)))
-          .map((content: any) => content.text)
-          .join("\n\n");
-        
-        if (formattedContent) {
-          // Stream the formatted content with tags
-          const lines = formattedContent.split('\n');
-          let accumulated = '';
-          
-          for (const line of lines) {
-            accumulated += line + '\n';
-            onChunk({
-              type: 'text_delta',
-              delta: line + '\n',
-              accumulated: accumulated.trim(),
-              isFormatted: true
-            });
-            await new Promise(resolve => setTimeout(resolve, 5));
-          }
-          
-          await this.contextManager.addMessage(
-            sessionId, 
-            'assistant', 
-            filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-            toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
-          );
-          
-          onChunk({
-            type: 'complete',
-            response: filterInternalIds(formattedContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-            toolsUsed: toolUsageLog,
-            skipClaudeResponse: true
-          });
-          return;
-        }
-      }
-
-      // Add tool results to the conversation
+      // Add sanitized tool results to the conversation for AI to format
       currentMessages.push({
         role: "user",
-        content: toolResults,
+        content: sanitizedToolResults,
       });
 
-      // Check for verbatim content
-      const hasVerbatimFlag = toolResults.some(result => 
-        result.content.some((content: any) => 
-          content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]")
-        )
-      );
-
-      if (hasVerbatimFlag) {
-        const verbatimContent = toolResults
-          .flatMap(result => result.content)
-          .filter((content: any) => content.type === "text" && content.text.includes("[DISPLAY_VERBATIM]"))
-          .map((content: any) => content.text.replace("[DISPLAY_VERBATIM] ", ""))
-          .join("\n\n");
-        
-        // Stream the verbatim content
-        const lines = verbatimContent.split('\n');
-        let accumulated = '';
-        
-        for (const line of lines) {
-          accumulated += line + '\n';
-          onChunk({
-            type: 'text_delta',
-            delta: line + '\n',
-            accumulated: accumulated.trim(),
-            isVerbatim: true
-          });
-          await new Promise(resolve => setTimeout(resolve, 10));
-        }
-        
-        await this.contextManager.addMessage(
-          sessionId, 
-          'assistant', 
-          filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-          toolUsageLog.length > 0 ? toolUsageLog.map(t => t.name) : undefined
-        );
-        
-        onChunk({
-          type: 'complete',
-          response: filterInternalIds(verbatimContent).replace('[DISPLAY_VERBATIM]', '').trim(),
-          toolsUsed: toolUsageLog
-        });
-        return;
-      }
-
-      // Continue the loop to handle the next iteration
+      // Continue the loop - AI will decide what to include in the response
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       console.error("Error in streaming conversation:", error);

@@ -1067,11 +1067,13 @@ export function registerBusinessTools(server: McpServer) {
           return { content: [{ type: "text", text: `Error fetching product details: ${data.message}` }] };
         }
   
+        const productData = data.result || data.data || data;
+        
         return {
           content: [
             {
               type: "text",
-              text: `Product Details (ID: ${product_id}):\n\n${JSON.stringify(data.result || data.data || data, null, 2)}\n\n📋 This product information includes detailed specifications and customer-specific data.`,
+              text: JSON.stringify({ result: productData }, null, 2),
             },
           ],
         };
@@ -1388,7 +1390,7 @@ export function registerBusinessTools(server: McpServer) {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: exactNameMatches[0] })
+                  text: JSON.stringify({ result: exactNameMatches[0] }, null, 2)
                 },
               ],
             };
@@ -1406,19 +1408,19 @@ export function registerBusinessTools(server: McpServer) {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: partialNameMatches[0] })
+                  text: JSON.stringify({ result: partialNameMatches[0] }, null, 2)
                 },
               ],
             };
           }
           
-          // If multiple matches, show them but indicate it's not exact
+          // If multiple matches, return them
           if (partialNameMatches.length > 1) {
             return {
               content: [
                 {
                   type: "text",
-                  text: JSON.stringify({ result: partialNameMatches })
+                  text: JSON.stringify({ result: partialNameMatches }, null, 2)
                 },
               ],
             };
@@ -1482,13 +1484,13 @@ export function registerBusinessTools(server: McpServer) {
         
         if (exactMatches.length === 1) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ result: exactMatches[0] }) }]
+            content: [{ type: "text", text: JSON.stringify({ result: exactMatches[0] }, null, 2) }]
           };
         }
         
         if (exactMatches.length > 1) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ result: exactMatches }) }]
+            content: [{ type: "text", text: JSON.stringify({ result: exactMatches }, null, 2) }]
           };
         }
         
@@ -1507,12 +1509,12 @@ export function registerBusinessTools(server: McpServer) {
         
         if (partialMatches.length === 1) {
           return {
-            content: [{ type: "text", text: JSON.stringify({ result: partialMatches[0] }) }]
+            content: [{ type: "text", text: JSON.stringify({ result: partialMatches[0] }, null, 2) }]
           };
         }
         
         return {
-          content: [{ type: "text", text: JSON.stringify({ result: partialMatches }) }]
+          content: [{ type: "text", text: JSON.stringify({ result: partialMatches }, null, 2) }]
         };
   
       } catch (error: any) {
@@ -1683,10 +1685,7 @@ export function registerBusinessTools(server: McpServer) {
         return {
           content: [{
             type: "text",
-            text: JSON.stringify({
-              formatted: formattedResponse,
-              raw: result
-            }, null, 2)
+            text: JSON.stringify({ result: formattedResponse, raw: result }, null, 2)
           }]
         };
   
@@ -1803,10 +1802,7 @@ export function registerBusinessTools(server: McpServer) {
         return {
           content: [{
             type: "text",
-            text: JSON.stringify({
-              formatted: formattedResponse,
-              raw: result
-            }, null, 2)
+            text: JSON.stringify({ result: formattedResponse, raw: result }, null, 2)
           }]
         };
   
@@ -2421,7 +2417,7 @@ export function registerBusinessTools(server: McpServer) {
           content: [
             {
               type: "text",
-              text: `Task Details (${task.custom_number}):\n\n${JSON.stringify(formattedTask, null, 2)}\n\n📋 This includes all task information including assignee details, dates, status, priority, and associated objects (estimates, invoices, etc.).`
+              text: JSON.stringify({ result: formattedTask }, null, 2)
             }
           ]
         };

@@ -345,26 +345,30 @@ export class ContextManager {
         console.log('updateActiveEntities: failed to parse extracted JSON');
       }
 
+      // Check for customer data - prioritize data.result structure (from findCustomerByName)
       if (data && (toolName.includes('Customer') || toolName.includes('customer'))) {
-        context.activeEntities.customerId = data.id?.toString() || data.customer_id?.toString();
-        context.activeEntities.customerName = data.name || data.customer_name;
+        // First check if data has a result property (from findCustomerByName tool)
+        if (data.result) {
+          const resultData = data.result;
+          if (Array.isArray(resultData) && resultData.length > 0) {
+            const latest = resultData[resultData.length - 1];
+            context.activeEntities.customerId = latest.id?.toString() || latest.customer_id?.toString();
+            context.activeEntities.customerName = latest.customer_name || latest.name;
+          } else if (resultData && (resultData.id || resultData.customer_id)) {
+            context.activeEntities.customerId = (resultData.id || resultData.customer_id)?.toString();
+            context.activeEntities.customerName = resultData.customer_name || resultData.name;
+          }
+        } else {
+          // Fallback: check direct properties (for other customer tools)
+          context.activeEntities.customerId = data.id?.toString() || data.customer_id?.toString();
+          context.activeEntities.customerName = data.name || data.customer_name;
+        }
         context.activeEntities.lastUpdated = Date.now();
         console.log('updateActiveEntities: set customerId and customerName:', context.activeEntities.customerId, context.activeEntities.customerName);
       }
-      // If data is parsed and has result, update as before
+      // If data is parsed and has result, update as before (for other entity types)
       if (data && data.result) {
         const resultData = data.result;
-        if (toolName.includes('Customer') && resultData) {
-          if (Array.isArray(resultData) && resultData.length > 0) {
-            const latest = resultData[resultData.length - 1];
-            context.activeEntities.customerId = latest.id?.toString();
-            context.activeEntities.customerName = latest.customer_name || latest.name;
-          } else if (resultData.id) {
-            context.activeEntities.customerId = resultData.id.toString();
-            context.activeEntities.customerName = resultData.customer_name || resultData.name;
-          }
-          context.activeEntities.lastUpdated = Date.now();
-        }
         if (toolName.includes('Product') && resultData) {
           if (Array.isArray(resultData) && resultData.length > 0) {
             const latest = resultData[resultData.length - 1];
